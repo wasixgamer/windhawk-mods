@@ -83,11 +83,12 @@ After setting UWPSpy at Sticky mode, the following Shortcuts can be used to trig
 Style syntax: `Property=Value`, `Property:=<Xaml/>`, `$name` constants.
 `TaskButton` also accepts `IconTintColor` and `IconTintOpacity`.
 
-## Background transparency
+## Global transparency and tint
 
-Set **Bar background** to an `#AARRGGBB` colour with alpha below `FF`. The mod
-swallows `WM_ERASEBKGND`, extends the DWM frame, applies an acrylic accent policy,
-and strips island root backgrounds.
+The transparency and tint configured in **Top bar background color** and **Top bar background opacity**
+are applied not only to the top bar, but also to all flyouts (Display, Sound, Wi‑Fi, Bluetooth, Tray)
+and to all context menus. When the opacity is below 100, the bar becomes translucent (acrylic blur);
+when it is 100, the bar is fully opaque.
 
 ## Known limitations
 
@@ -593,12 +594,7 @@ TreeElementMatcher ParseMatcherPart(std::wstring_view part) {
         return m;
     }
     
-    // ':root > ' prefix — next matcher must be a root element (no parent)
     std::wstring_view trimmedPart = part;
-    if (trimmedPart.starts_with(L":root > ")) {
-        m.rootRequired = true;
-        trimmedPart = trimmedPart.substr(8);
-    }
     
     auto hashPos = trimmedPart.find(L'#');
     if (hashPos != std::wstring_view::npos) {
@@ -614,17 +610,22 @@ TreeElementMatcher ParseMatcherPart(std::wstring_view part) {
 std::vector<TreeElementMatcher> ParseTargetChain(std::wstring_view target) {
     std::vector<TreeElementMatcher> result;
     size_t pos = 0;
+    bool rootRequired = false;
+    // Check the whole string before splitting.
+    if (target.starts_with(L":root > ")) {
+        rootRequired = true;
+        target = target.substr(8); // remove ":root > "
+    }
     while (pos <= target.size()) {
         size_t arrow = target.find(L" > ", pos);
         auto partSv = target.substr(
             pos, arrow == std::wstring_view::npos ? std::wstring_view::npos : arrow - pos);
         std::wstring trimmed = TrimWs(partSv);
-        if (trimmed.starts_with(L":root > ")) {
-            // Remove the prefix and mark the next matcher as root-required
-            trimmed = TrimWs(trimmed.substr(8)); // remove ":root > "
+        if (rootRequired) {
             auto matcher = ParseMatcherPart(trimmed);
-            matcher.rootRequired = true;         // the actual matcher must be a root element
+            matcher.rootRequired = true;
             result.push_back(std::move(matcher));
+            rootRequired = false; // only first matcher is root‑required
         } else {
             result.push_back(ParseMatcherPart(trimmed));
         }
@@ -3777,7 +3778,12 @@ void RepopulateLater(const std::function<void()>& populate) {
 }
 
 wuxm::SolidColorBrush FlyoutBackgroundBrush() {
-    return MakeBrush(0xF2, 0x20, 0x20, 0x20);
+    // Use the same tint and opacity as the top bar so all surfaces match.
+    wui::Color tint;
+    if (!ParseBarColor(g_settings.topBarBackgroundColor, g_settings.topBarBackgroundOpacity, &tint)) {
+        tint = wui::ColorHelper::FromArgb(128, 0, 0, 0); // fallback: translucent black
+    }
+    return wuxm::SolidColorBrush(tint);
 }
 
 // One presenter style for every flyout, so the panels share the bar's rounded
@@ -4174,7 +4180,7 @@ void PopulateDisplayPanel() {
     if (brightness::Available()) {
         auto icon = BuildVectorIcon(nullptr, L"", icons::kBrightnessStroke, 24, 18, 1.6);
         children.Append(MakeSliderRow(icon, brightness::Get(),
-                                      [](int value) { RunInBackground([value] { brightness::Set(value); }); }));
+                                      [](int value) { RunOnUiThread([value] { brightness::Set(value); }); }));
     } else {
         children.Append(MakeStatusText(L"Brightness control isn't available on this display."));
     }
@@ -5620,7 +5626,7 @@ void AttachWheelHandler(wuxc::Button const& button, bool isVolume) {
                     g_volumeRevertTimer.Start();
                 } else {
                     int newBrightness = std::clamp(brightness::GetFast() + step * direction, 0, 100);
-                    RunInBackground([newBrightness] { brightness::Set(newBrightness); });
+                    RunOnUiThread([newBrightness] { brightness::Set(newBrightness); });
                     ShowBrightnessPercent(newBrightness);
 
                     if (!g_brightnessRevertTimer) {
@@ -6096,13 +6102,13 @@ SetWindowCompositionAttribute_t GetSetWindowCompositionAttribute() {
     return function;
 }
 
-bool WantsTranslucentBar() {
-    // Always return true because the WindhawkBlur brush on TopBarRoot handles the tint
-    return true;
+bool WantsGlobalTransparency() {
+    // Only enable backdrop when the top bar background is actually translucent
+    return g_settings.topBarBackgroundOpacity < 100;
 }
 
 void ApplyWindowBackdrop(HWND hwnd) {
-    if (!WantsTranslucentBar()) {
+    if (!WantsGlobalTransparency()) {
         return;
     }
 
