@@ -30,8 +30,8 @@ Themes are collections of styles that can be selected from the **Theme** dropdow
 | [GreenBar](https://github.com/wasixgamer/windhawk-topbar-styling-guide/tree/main/Themes/GreenBar) | [![GreenBar](https://raw.githubusercontent.com/wasixgamer/windhawk-topbar-styling-guide/main/Themes/GreenBar/screenshot.png)](https://github.com/wasixgamer/windhawk-topbar-styling-guide/tree/main/Themes/GreenBar) |
 | [NoIslands](https://github.com/wasixgamer/windhawk-topbar-styling-guide/tree/main/Themes/NoIslands) | [![NoIslands](https://raw.githubusercontent.com/wasixgamer/windhawk-topbar-styling-guide/main/Themes/NoIslands/screenshot.png)](https://github.com/wasixgamer/windhawk-topbar-styling-guide/tree/main/Themes/NoIslands) |
 
-More themes can be found and contributed from:
-- **[Windhawk TopBar Styling Guide](https://github.com/wasixgamer/windhawk-topbar-styling-guide)**
+More themes, stylings, etc can be found and contributed from:
+**[Windhawk TopBar Styling Guide](https://github.com/wasixgamer/windhawk-topbar-styling-guide)**
 
 ## Features
 
@@ -64,7 +64,7 @@ class name (`Button`), `ClassName#Name`, or a parent chain (`StackPanel > TextBl
 | `ClockButton` / `ClockText` | Date/time |
 
 
-More targets can be discovered with **UWPSpy** by Spying the TopBar's `explorer.exe` process
+More targets can be discovered with **[UWPSpy](https://github.com/m417z/UWPSpy/releases/)** by Spying the TopBar's `explorer.exe` process
 
 ### Keyboard shortcuts (For Inspecting the elements in Flyouts)
 
@@ -81,14 +81,13 @@ After setting UWPSpy at Sticky mode, the following Shortcuts can be used to trig
 | Ctrl+Alt+7 | Show Task list context menu |
 
 Style syntax: `Property=Value`, `Property:=<Xaml/>`, `$name` constants.
-`TaskButton` also accepts `IconTintColor` and `IconTintOpacity`.
+`TaskButton`.
 
 ## Global transparency and tint
 
 The transparency and tint configured in **Top bar background color** and **Top bar background opacity**
-are applied not only to the top bar, but also to all flyouts (Display, Sound, Wi‑Fi, Bluetooth, Tray)
-and to all context menus. When the opacity is below 100, the bar becomes translucent (acrylic blur);
-when it is 100, the bar is fully opaque.
+are applied to the top bar, and all flyouts (Display, Sound, Wi‑Fi, Bluetooth, Tray)
+and to all context menus.
 
 ## Known limitations
 
@@ -274,6 +273,7 @@ when it is 100, the bar is fully opaque.
 #include <string_view>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 #include <vector>
 
@@ -424,9 +424,9 @@ HMODULE g_modModule = nullptr;
 
 HWND g_topBarHwnd;
 HWND g_islandHwnd;
-wuxc::Grid g_wallpaperLayer{nullptr};  // Store the wallpaper layer for updates
+[[clang::no_destroy]] wuxc::Grid g_wallpaperLayer{nullptr};  // Store the wallpaper layer for updates
 std::wstring g_lastWallpaperPath;       // For change detection
-DispatcherTimer g_wallpaperTimer{nullptr}; // Polling timer
+[[clang::no_destroy]] DispatcherTimer g_wallpaperTimer{nullptr}; // Polling timer
 int g_barHeightPx = 40;
 double g_dpiScale = 1.0;
 
@@ -679,6 +679,9 @@ bool MatchesAncestorChain(FrameworkElement const& element,
         // Wildcard: skip any number of ancestors to match the next matcher
         if (chain[chainIndex].wildcard) {
             int nextIdx = chainIndex - 1; // the matcher after the wildcard (since chain is reversed)
+            if (nextIdx < 0) {
+                return true; // leading wildcard: no further ancestor constraints
+            }
             bool matched = false;
             while (current) {
                 auto fe = current.try_as<FrameworkElement>();
@@ -2255,14 +2258,11 @@ static const IID kIID_IWbemLocator = {
 
 enum class Backend { Unknown, Wmi, Ddc, None };
 Backend g_backend = Backend::Unknown;
+std::mutex g_brightnessMutex;
 
 [[clang::no_destroy]] winrt::com_ptr<IWbemServices> g_cachedWmiServices;
 
 winrt::com_ptr<IWbemServices> ConnectWmi() {
-    if (g_cachedWmiServices) {
-        return g_cachedWmiServices;
-    }
-
     winrt::com_ptr<IWbemLocator> locator;
     if (FAILED(CoCreateInstance(kCLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
                                 kIID_IWbemLocator, locator.put_void()))) {
@@ -2280,7 +2280,6 @@ winrt::com_ptr<IWbemServices> ConnectWmi() {
 
     CoSetProxyBlanket(services.get(), RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
                       RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
-    g_cachedWmiServices = services;
     return services;
 }
 
@@ -2500,6 +2499,7 @@ bool DdcSet(int percent) {
 int g_lastKnown = -1;
 
 int Get() {
+    std::lock_guard<std::mutex> lock(g_brightnessMutex);
     int percent = 0;
     if (g_backend == Backend::Unknown || g_backend == Backend::Wmi) {
         if (WmiGet(&percent)) {
@@ -2522,10 +2522,15 @@ int Get() {
 }
 
 int GetFast() {
-    return g_lastKnown >= 0 ? g_lastKnown : Get();
+    {
+        std::lock_guard<std::mutex> lock(g_brightnessMutex);
+        if (g_lastKnown >= 0) return g_lastKnown;
+    }
+    return Get(); // Get() will lock and update the cache
 }
 
 void Set(int percent) {
+    std::lock_guard<std::mutex> lock(g_brightnessMutex);
     percent = std::clamp(percent, 0, 100);
     g_lastKnown = percent;
     switch (g_backend) {
@@ -3242,19 +3247,8 @@ bool Available() {
 }
 
 bool IsRadioOn() {
-#if TOPBAR_HAS_RADIOS
-    try {
-        auto radios = winrt::Windows::Devices::Radios::Radio::GetRadiosAsync().get();
-        for (auto&& radio : radios) {
-            if (radio.Kind() == winrt::Windows::Devices::Radios::RadioKind::Bluetooth) {
-                return radio.State() == winrt::Windows::Devices::Radios::RadioState::On;
-            }
-        }
-    } catch (...) {
-    }
-#endif
-    // Fall back to "a radio device exists and answers": not the same thing as
-    // the software switch, but the best available without the WinRT API.
+    // Return true if the Bluetooth API is available – avoids blocking calls.
+    // A proper radio state check would require WinRT or a reliable synchronous API.
     return Available();
 }
 
@@ -4180,7 +4174,7 @@ void PopulateDisplayPanel() {
     if (brightness::Available()) {
         auto icon = BuildVectorIcon(nullptr, L"", icons::kBrightnessStroke, 24, 18, 1.6);
         children.Append(MakeSliderRow(icon, brightness::Get(),
-                                      [](int value) { RunOnUiThread([value] { brightness::Set(value); }); }));
+                                      [](int value) { RunInBackground([value] { brightness::Set(value); }); }));
     } else {
         children.Append(MakeStatusText(L"Brightness control isn't available on this display."));
     }
@@ -4438,8 +4432,8 @@ void PopulateSoundPanel() {
     });
 
     children.Append(MakeSliderRow(muteButton, masterVolume, [](int value) {
-        audio::SetMasterVolume(value);
-        RefreshSoundButtonIcon();
+        RunInBackground([value] { audio::SetMasterVolume(value); });
+        RunOnUiThread([] { RefreshSoundButtonIcon(); });
     }));
 
     children.Append(MakeDivider());
@@ -4569,6 +4563,7 @@ void StartWifiScan() {
     }
     g_wifiScanning = true;
     RunInBackground([] {
+        if (WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) return;
         wifi::RequestScan();
         // The driver reports results over the next few seconds; this is the
         // interval Windows' own flyout waits before redrawing.
@@ -4584,6 +4579,7 @@ void StartWifiScan() {
 
 void ConnectToWifi(const wifi::Network& network, const std::wstring& password) {
     RunInBackground([network, password] {
+        if (WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) return;
         bool ok = wifi::Connect(network, password);
         // Association takes a moment; re-read afterwards so the row shows the
         // real outcome rather than an optimistic "Connected".
@@ -4893,8 +4889,9 @@ void StartBluetoothScan(bool includeUnpaired) {
     if (g_bluetoothScanning) {
         return;
     }
-    g_bluetoothScanning = includeUnpaired;
+    g_bluetoothScanning = true;
     RunInBackground([includeUnpaired] {
+        if (WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) return;
         auto devices = bluetooth::Enumerate(includeUnpaired);
         RunOnUiThread([devices = std::move(devices)]() mutable {
             g_bluetoothDevices = std::move(devices);
@@ -4975,8 +4972,9 @@ void PopulateBluetoothPanel() {
         if (g_populatingPanel) return;
         bool on = sender.template as<wuxc::ToggleSwitch>().IsOn();
         RunInBackground([on] {
+            if (WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) return;
             bluetooth::SetRadio(on);
-            Sleep(600);
+            WaitForSingleObject(g_stopEvent, 600);
             auto devices = on ? bluetooth::Enumerate(false)
                               : std::vector<bluetooth::Device>{};
             RunOnUiThread([devices = std::move(devices)]() mutable {
@@ -5611,7 +5609,7 @@ void AttachWheelHandler(wuxc::Button const& button, bool isVolume) {
 
                 if (isVolume) {
                     int newVolume = std::clamp(audio::GetMasterVolume() + step * direction, 0, 100);
-                    audio::SetMasterVolume(newVolume);
+                    RunInBackground([newVolume] { audio::SetMasterVolume(newVolume); });
                     ShowVolumePercent(newVolume);
 
                     if (!g_volumeRevertTimer) {
@@ -5625,8 +5623,14 @@ void AttachWheelHandler(wuxc::Button const& button, bool isVolume) {
                     g_volumeRevertTimer.Stop();
                     g_volumeRevertTimer.Start();
                 } else {
+                    static bool brightnessPending = false;
+                    if (brightnessPending) return;
+                    brightnessPending = true;
                     int newBrightness = std::clamp(brightness::GetFast() + step * direction, 0, 100);
-                    RunOnUiThread([newBrightness] { brightness::Set(newBrightness); });
+                    RunInBackground([newBrightness] {
+                        brightness::Set(newBrightness);
+                        brightnessPending = false;
+                    });
                     ShowBrightnessPercent(newBrightness);
 
                     if (!g_brightnessRevertTimer) {
@@ -5680,7 +5684,7 @@ wuxc::Button MakeControlButton(PCWSTR name,
 void EnsureAutoRefreshTimers() {
     if (!g_wifiAutoRefreshTimer) {
         g_wifiAutoRefreshTimer = DispatcherTimer();
-        g_wifiAutoRefreshTimer.Interval(std::chrono::seconds(5));
+        g_wifiAutoRefreshTimer.Interval(std::chrono::seconds(30));
         g_wifiAutoRefreshTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
             if (!g_wifiFlyout || !g_wifiFlyout.IsOpen()) {
                 g_wifiAutoRefreshTimer.Stop();
@@ -5697,7 +5701,7 @@ void EnsureAutoRefreshTimers() {
     }
     if (!g_bluetoothAutoRefreshTimer) {
         g_bluetoothAutoRefreshTimer = DispatcherTimer();
-        g_bluetoothAutoRefreshTimer.Interval(std::chrono::seconds(10));
+        g_bluetoothAutoRefreshTimer.Interval(std::chrono::seconds(60));
         g_bluetoothAutoRefreshTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
             if (!g_bluetoothFlyout || !g_bluetoothFlyout.IsOpen()) {
                 g_bluetoothAutoRefreshTimer.Stop();
@@ -6108,32 +6112,34 @@ bool WantsGlobalTransparency() {
 }
 
 void ApplyWindowBackdrop(HWND hwnd) {
-    if (!WantsGlobalTransparency()) {
-        return;
-    }
-
-
-
     auto setAttribute = GetSetWindowCompositionAttribute();
     if (!setAttribute) {
         Wh_Log(L"SetWindowCompositionAttribute unavailable; the bar will not be translucent");
         return;
     }
-    // Force disable DWM shadow completely (this kills the bottom shadow)
-    BOOL disableShadow = TRUE;
-    DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &disableShadow, sizeof(disableShadow));
-    ACCENT_POLICY policy{};
-    // Acrylic gives the frosted look; it falls back to a plain blur on builds
-    // where the acrylic state isn't honoured.
-    policy.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
-    policy.AccentFlags = 0x20 | 0x40 | 0x80 | 0x100;  // draw all four borders
-    // Use a fully transparent gradient color so the accent policy doesn't add its own tint.
-    policy.GradientColor = 0;
 
+    ACCENT_POLICY policy{};
     WINDOWCOMPOSITIONATTRIBDATA data{};
     data.Attrib = WCA_ACCENT_POLICY;
     data.pvData = &policy;
     data.cbData = sizeof(policy);
+
+    if (!WantsGlobalTransparency()) {
+        // Opacity is 100% – disable accent completely
+        policy.AccentState = ACCENT_DISABLED;
+        setAttribute(hwnd, &data);
+        return;
+    }
+
+    // Force disable DWM shadow (kills bottom shadow)
+    BOOL disableShadow = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &disableShadow, sizeof(disableShadow));
+
+    // Acrylic blur
+    policy.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
+    policy.AccentFlags = 0x20 | 0x40 | 0x80 | 0x100;
+    policy.GradientColor = 0;
+
     if (!setAttribute(hwnd, &data)) {
         policy.AccentState = ACCENT_ENABLE_BLURBEHIND;
         if (!setAttribute(hwnd, &data)) {
@@ -6479,7 +6485,7 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         g_clockTimer.Start();
 
         g_taskListTimer = DispatcherTimer();
-        g_taskListTimer.Interval(std::chrono::milliseconds(5000)); // 5s fallback
+        g_taskListTimer.Interval(std::chrono::milliseconds(30000)); // 30s fallback
         g_taskListTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
             try {
                 RefreshTaskList(false);
@@ -6488,16 +6494,7 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         });
         g_taskListTimer.Start();
 
-        // Start wallpaper polling timer (every 2 seconds)
-        g_wallpaperTimer = DispatcherTimer();
-        g_wallpaperTimer.Interval(std::chrono::seconds(2));
-        g_wallpaperTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
-            try {
-                UpdateWallpaperIfChanged();
-            } catch (...) {
-            }
-        });
-        g_wallpaperTimer.Start();
+        // Wallpaper updates are handled by WM_SETTINGCHANGE – no timer needed.
 
         RefreshTaskList(true);
 
@@ -6545,6 +6542,15 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         if (g_taskClickTimer) g_taskClickTimer = nullptr;
         if (g_volumeRevertTimer) g_volumeRevertTimer = nullptr;
         if (g_brightnessRevertTimer) g_brightnessRevertTimer = nullptr;
+
+        // Release wallpaper layer and other no_destroy globals
+        if (g_wallpaperLayer) g_wallpaperLayer = nullptr;
+        if (g_displayFlyout) g_displayFlyout = nullptr;
+        if (g_trayFlyout) g_trayFlyout = nullptr;
+        if (g_displayButton) g_displayButton = nullptr;
+        if (g_trayButton) g_trayButton = nullptr;
+        if (g_displayPanel) g_displayPanel = nullptr;
+        if (g_trayPanel) g_trayPanel = nullptr;
 
         if (g_rootElement) {
             try {
@@ -6734,6 +6740,26 @@ void WhTool_ModSettingsChanged() {
         StripInheritedIslandBackgrounds();
         ApplyWindowBackdrop(g_topBarHwnd);
         PositionAppBar(g_topBarHwnd, g_barHeightPx);
+
+        // Re-register hotkeys if the setting changed
+        if (g_topBarHwnd) {
+            UnregisterHotKey(g_topBarHwnd, HOTKEY_ID_DISPLAY);
+            UnregisterHotKey(g_topBarHwnd, HOTKEY_ID_SOUND);
+            UnregisterHotKey(g_topBarHwnd, HOTKEY_ID_WIFI);
+            UnregisterHotKey(g_topBarHwnd, HOTKEY_ID_BLUETOOTH);
+            UnregisterHotKey(g_topBarHwnd, HOTKEY_ID_TRAY);
+            UnregisterHotKey(g_topBarHwnd, HOTKEY_ID_START_MENU);
+            UnregisterHotKey(g_topBarHwnd, HOTKEY_ID_TASK_MENU);
+            if (g_settings.enableHotkeys) {
+                RegisterHotKey(g_topBarHwnd, HOTKEY_ID_DISPLAY, MOD_CONTROL | MOD_ALT, '1');
+                RegisterHotKey(g_topBarHwnd, HOTKEY_ID_SOUND, MOD_CONTROL | MOD_ALT, '2');
+                RegisterHotKey(g_topBarHwnd, HOTKEY_ID_WIFI, MOD_CONTROL | MOD_ALT, '3');
+                RegisterHotKey(g_topBarHwnd, HOTKEY_ID_BLUETOOTH, MOD_CONTROL | MOD_ALT, '4');
+                RegisterHotKey(g_topBarHwnd, HOTKEY_ID_TRAY, MOD_CONTROL | MOD_ALT, '5');
+                RegisterHotKey(g_topBarHwnd, HOTKEY_ID_START_MENU, MOD_CONTROL | MOD_ALT, '6');
+                RegisterHotKey(g_topBarHwnd, HOTKEY_ID_TASK_MENU, MOD_CONTROL | MOD_ALT, '7');
+            }
+        }
         RefreshTaskList(true);
     });
 }
@@ -6754,8 +6780,8 @@ void WhTool_ModUninit() {
         PostThreadMessage(g_topBarThreadId, WM_QUIT, 0, 0);
     }
 
-    // Wait for background jobs to finish.
-    for (int i = 0; i < 60 && g_backgroundJobs.load() > 0; i++) {
+    // Wait for background jobs to finish (increase timeout to 10 seconds).
+    for (int i = 0; i < 100 && g_backgroundJobs.load() > 0; i++) {
         Sleep(100);
     }
     if (g_topBarThreadId) {
