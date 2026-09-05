@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              windhawk-topbar
 // @name            TopBar for Windhawk
-// @description     A feature-rich top taskbar hosted by a dedicated Explorer tool process
+// @description     A working TopBar with Flyouts for Windows through Windhawk.
 // @version         1.0.0
 // @author          WasiXGamer
 // @github          https://github.com/wasixgamer
