@@ -16,8 +16,8 @@
 
 ![TopBar screenshot](https://i.imgur.com/bryjzKr.png)
 
-Adds a **second, fully independent taskbar docked to the top of the screen**, hosted by a
-dedicated Explorer tool process.
+Adds a **TopBar** at top of your screen with multiple customizations, hosted by a
+dedicated explorer.exe tool process.
 
 [![Patreon](https://i.imgur.com/JJ0TluA.png)](https://www.patreon.com/WasiXGamer/join)
 
@@ -3138,6 +3138,9 @@ bool ForgetProfile(const std::wstring& profileName) {
 
 namespace bluetooth {
 
+bool g_bluetoothRadioOn = false;
+std::mutex g_bluetoothRadioMutex;
+
 using BluetoothFindFirstRadio_t = HANDLE(WINAPI*)(const BLUETOOTH_FIND_RADIO_PARAMS*, HANDLE*);
 using BluetoothFindNextRadio_t = BOOL(WINAPI*)(HANDLE, HANDLE*);
 using BluetoothFindRadioClose_t = BOOL(WINAPI*)(HANDLE);
@@ -3240,16 +3243,15 @@ struct Device {
     ULONG classOfDevice = 0;
 };
 
+bool IsRadioOn() {
+    std::lock_guard<std::mutex> lock(g_bluetoothRadioMutex);
+    return g_bluetoothRadioOn;
+}
+
 bool Available() {
     // Only check if the API exists, NOT if the radio handle exists.
     // This keeps the toggle enabled when the radio is off, so you can turn it back on.
     return GetApi().valid();
-}
-
-bool IsRadioOn() {
-    // Return true if the Bluetooth API is available – avoids blocking calls.
-    // A proper radio state check would require WinRT or a reliable synchronous API.
-    return Available();
 }
 
 bool SetRadio(bool on) {
@@ -3710,6 +3712,9 @@ std::vector<wifi::Network> g_wifiNetworks;
 bool g_wifiScanning = false;
 std::wstring g_wifiConnectingSSID;
 int g_bluetoothConnectingState = 0; // 0=None, 1=Connecting, 2=Disconnecting
+
+// bool g_bluetoothRadioOn = false;   // moved inside bluetooth namespace
+// std::mutex g_bluetoothRadioMutex;  // moved inside bluetooth namespace
 
 void RunOnUiThread(std::function<void()> work) {
     if (InterlockedCompareExchange(&g_shuttingDown, 0, 0) != 0) {
@@ -4594,6 +4599,10 @@ void ConnectToWifi(const wifi::Network& network, const std::wstring& password) {
             }
         }
 
+        if (!connected) {
+            wifi::ForgetProfile(network.ssid);
+        }
+
         RunOnUiThread([networks = std::move(networks), connected, network]() mutable {
             g_wifiNetworks = std::move(networks);
             g_wifiPasswordPrompt = false;
@@ -4901,6 +4910,37 @@ void StartBluetoothScan(bool includeUnpaired) {
     });
 }
 
+void RefreshBluetoothRadioState() {
+    RunInBackground([] {
+        bool on = false;
+#if TOPBAR_HAS_RADIOS
+        try {
+            using namespace winrt::Windows::Devices::Radios;
+            auto access = Radio::RequestAccessAsync().get();
+            if (access == RadioAccessStatus::Allowed) {
+                auto radios = Radio::GetRadiosAsync().get();
+                for (auto&& radio : radios) {
+                    if (radio.Kind() == RadioKind::Bluetooth) {
+                        on = (radio.State() == RadioState::On);
+                        break;
+                    }
+                }
+            }
+        } catch (...) {}
+#endif
+        {
+            std::lock_guard<std::mutex> lock(bluetooth::g_bluetoothRadioMutex);
+            bluetooth::g_bluetoothRadioOn = on;
+        }
+        RunOnUiThread([] {
+            RefreshBluetoothButtonIcon();
+            if (g_bluetoothFlyout && g_bluetoothFlyout.IsOpen()) {
+                PopulateBluetoothPanel();
+            }
+        });
+    });
+}
+
 void PopulateBluetoothPanel() {
     if (!g_bluetoothPanel) {
         return;
@@ -4981,6 +5021,7 @@ void PopulateBluetoothPanel() {
                 g_bluetoothDevices = std::move(devices);
                 RefreshBluetoothButtonIcon();
                 PopulateBluetoothPanel();
+                RefreshBluetoothRadioState(); // update cached state after change
             });
         });
     });
@@ -5898,6 +5939,7 @@ FrameworkElement BuildTopBarContent() {
     {
         auto icon = BuildVectorIcon(nullptr, L"", icons::kBluetoothStroke, 24, 18, 1.8);
     g_bluetoothButton = MakeControlButton(L"BluetoothButton", icon, g_bluetoothFlyout, [] {
+        RefreshBluetoothRadioState(); // update radio state in background
         g_bluetoothDevices = bluetooth::Enumerate(false);
         PopulateBluetoothPanel();
         EnsureAutoRefreshTimers();
@@ -6260,6 +6302,7 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
             g_barHeightPx = static_cast<int>(g_settings.barHeightDip * g_dpiScale + 0.5);
             PositionAppBar(hwnd, g_barHeightPx);
             RefreshTaskList(true);
+        RefreshBluetoothRadioState(); // initial radio state
             return 0;
 
         case WM_SETTINGCHANGE:
