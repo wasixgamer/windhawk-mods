@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              windhawk-topbar
-// @name            TopBar for Windows
+// @id              windhawk-topbar-test
+// @name            TopBar for Windows - BETA
 // @donateUrl       https://www.patreon.com/WasiXGamer/join
 // @description     A working TopBar with Flyouts for Windows through Windhawk.
 // @version         1.2.0
@@ -986,6 +986,11 @@ void StripInheritedIslandBackgrounds();
 void ApplyWindowBackdrop(HWND hwnd);
 void ApplyModernWindowChrome(HWND hwnd);
 std::wstring ReadTrayOrder();
+void SetTopBarContent(FrameworkElement content);
+void RepositionTopBarPopup();
+void EnsureTopBarPopupShown();
+void PromoteChildFlyoutPopups();
+HWND FindOpenChildFlyoutHwnd();
 
 void LoadSettings();
 double GetBarDpiScale();
@@ -1248,6 +1253,53 @@ double g_dpiScale = 1.0;
 [[clang::no_destroy]] wuxh::WindowsXamlManager g_xamlManager{nullptr};
 [[clang::no_destroy]] wuxh::DesktopWindowXamlSource g_desktopSource{nullptr};
 [[clang::no_destroy]] winrt::Windows::System::DispatcherQueue g_uiDispatcherQueue{nullptr};
+[[clang::no_destroy]] wuxc::Flyout g_topBarPopup{nullptr};
+[[clang::no_destroy]] wuxc::Canvas g_topBarPopupCanvas{nullptr};
+[[clang::no_destroy]] wuxc::Grid g_topBarPopupAnchor{nullptr};
+[[clang::no_destroy]] DispatcherTimer g_topBarPopupRetryTimer{nullptr};
+static bool g_topBarAllowClose = false;
+static bool g_topBarPopupShowAtCalled = false;
+static HWND g_topBarPopupHwnd = nullptr;
+static int g_topBarPopupPinTicks = 0;
+static HWND g_subclassedPopupHwnd = nullptr;
+static WNDPROC g_prevPopupProc = nullptr;
+static std::atomic<bool> g_anyChildFlyoutOpen{false};
+static HHOOK g_childFlyoutMouseHook = nullptr;
+
+// Every open flyout / context menu is registered here so that
+// CloseAnyOpenChildFlyout can dismiss all of them, and so the topbar's
+// topmost re-assertion can back off while any of them is open. Without
+// this the reorder flyouts and MenuFlyouts were invisible to the dismissal
+// logic and left the topbar in a half-active state.
+static std::mutex g_openPopupMutex;
+static std::vector<wuxc::Primitives::FlyoutBase> g_openPopups;
+
+void PromoteChildFlyoutPopups();
+
+void RegisterOpenPopup(wuxc::Primitives::FlyoutBase const& fb) {
+    if (!fb) return;
+    std::lock_guard<std::mutex> lock(g_openPopupMutex);
+    for (auto const& existing : g_openPopups) {
+        if (existing == fb) return;
+    }
+    g_openPopups.push_back(fb);
+    g_anyChildFlyoutOpen = true;
+    // Promote on the next dispatcher turn, after XAML has created the
+    // popup HWND for the flyout we just registered.
+    RunOnUiThread([] {
+        try { PromoteChildFlyoutPopups(); } catch (...) {}
+    });
+}
+
+void UnregisterOpenPopup(wuxc::Primitives::FlyoutBase const& fb) {
+    if (!fb) return;
+    std::lock_guard<std::mutex> lock(g_openPopupMutex);
+    g_openPopups.erase(
+        std::remove_if(g_openPopups.begin(), g_openPopups.end(),
+                       [&](auto const& e) { return e == fb; }),
+        g_openPopups.end());
+    g_anyChildFlyoutOpen = !g_openPopups.empty();
+}
 
 [[clang::no_destroy]] DispatcherTimer g_clockTimer{nullptr};
 [[clang::no_destroy]] DispatcherTimer g_blurRefreshTimer{nullptr};
@@ -3213,6 +3265,56 @@ void ForceForegroundWindow(HWND hwnd) {
     }
 }
 
+
+// Brings the topbar's XAML island into the foreground so that keystrokes
+// reach our message loop, where DesktopWindowXamlSourceNative2::PreTranslateMessage
+// routes them into the XAML tree. Without this, clicking a text box inside
+// a flyout gives it XAML-level focus but no keyboard input arrives, because
+// the topbar HWND was shown with SW_SHOWNOACTIVATE and never becomes the
+// foreground window. Called from text-input GotFocus handlers only, so it
+// doesn't steal focus from the user's app on every topbar interaction.
+void EnsureTopBarHasKeyboardFocus() {
+    if (!g_topBarHwnd || !IsWindow(g_topBarHwnd)) return;
+
+    DWORD ourThread = GetCurrentThreadId();
+    HWND fg = GetForegroundWindow();
+    DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+
+    // Already foreground on our thread — keystrokes are landing in our
+    // message loop and PreTranslateMessage will route them into the XAML
+    // tree. Nothing to do.
+    if (fgThread == ourThread) return;
+
+    // Pick the HWND to activate. When a child flyout is open, its own XAML
+    // popup HWND is the correct target: XAML already considers it the
+    // current popup, so activating it doesn't trigger any teardown. When no
+    // child flyout is open, activate the plain topbar HWND.
+    HWND target = nullptr;
+    if (g_anyChildFlyoutOpen.load()) {
+        target = FindOpenChildFlyoutHwnd();
+    }
+    if (!target) {
+        target = g_topBarHwnd;
+    }
+
+    bool attached = false;
+    if (fgThread && fgThread != ourThread) {
+        attached = AttachThreadInput(ourThread, fgThread, TRUE) != FALSE;
+    }
+    SetForegroundWindow(target);
+    if (attached) {
+        AttachThreadInput(ourThread, fgThread, FALSE);
+    }
+
+    // Activating the bar HWND may have promoted it above the open child
+    // flyout, which would then render dim under the bar's translucent plate.
+    // Re-stack the child popups above the bar.
+    if (g_anyChildFlyoutOpen.load()) {
+        RunOnUiThread([] {
+            try { PromoteChildFlyoutPopups(); } catch (...) {}
+        });
+    }
+}
 
 void CALLBACK ForegroundEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
                                   LONG idChild, DWORD, DWORD) {
@@ -6307,6 +6409,14 @@ wuxc::Flyout MakeControlFlyout(PCWSTR name, wuxc::StackPanel& contentOut) {
     // user's fix.)
     flyout.ShouldConstrainToRootBounds(false);
 
+    // Register in the global popup list so the dismissal logic can find us.
+    flyout.Opened([](auto&& sender, auto&&) {
+        RegisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
+    });
+    flyout.Closed([](auto&& sender, auto&&) {
+        UnregisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
+    });
+
     // When the flyout opens, register the topmost visual root (like FlyoutPresenter)
     // so targets like `FlyoutPresenter` or `FlyoutPresenter > Grid` also match.
     flyout.Opened([flyout](auto&&, auto&&) {
@@ -7642,9 +7752,26 @@ void BuildWifiPasswordView(const wf::Collections::IVector<UIElement>& children) 
 
     children.Append(buttons);
 
-    // Focus can only be taken once the box is actually in the tree.
-    passwordBox.Loaded([passwordBox](auto&&, auto&&) {
-        passwordBox.Focus(FocusState::Programmatic);
+    // Focus can only be taken once the box is actually in the tree. Retry
+    // across a few dispatcher ticks because the presenter's layout pass
+    // may replace the TextBox's inner focusable element on the first tick.
+    auto refocus = [passwordBox] {
+        try { passwordBox.Focus(FocusState::Programmatic); } catch (...) {}
+    };
+    passwordBox.Loaded([refocus](auto&&, auto&&) {
+        refocus();
+        RunOnUiThread([refocus] {
+            refocus();
+            RunOnUiThread([refocus] { refocus(); });
+        });
+    });
+
+    // Same rationale as the weather search box: defer the activation so it
+    // doesn't re-enter XAML while the flyout is still opening.
+    passwordBox.GotFocus([](auto&&, auto&&) {
+        RunOnUiThread([] {
+            try { EnsureTopBarHasKeyboardFocus(); } catch (...) {}
+        });
     });
 }
 
@@ -9212,6 +9339,18 @@ void BuildWeatherLocationPicker(const wf::Collections::IVector<UIElement>& child
     searchBox.Loaded([searchBox](auto&&, auto&&) {
         searchBox.Focus(FocusState::Programmatic);
     });
+
+    // Keyboard input can only reach a XAML TextBox in this island if the
+    // topbar HWND is the foreground window. Force that on focus, but defer
+    // it off the XAML event: GotFocus fires while the flyout is still being
+    // realized, and activating the bar synchronously from inside the handler
+    // re-enters XAML's layout/teardown and crashes. One dispatcher turn is
+    // enough for the presenter to finish.
+    searchBox.GotFocus([](auto&&, auto&&) {
+        RunOnUiThread([] {
+            try { EnsureTopBarHasKeyboardFocus(); } catch (...) {}
+        });
+    });
 }
 
 void BuildWeatherView(const wf::Collections::IVector<UIElement>& children) {
@@ -9867,8 +10006,12 @@ void StyleMenuFlyout(wuxc::MenuFlyout const& menu) {
     // Same reason as the control flyouts: the XAML root is bar-height, so a menu
     // constrained to it would be clipped away entirely.
     menu.ShouldConstrainToRootBounds(false);
-    menu.Opened([](auto&&, auto&&) {
+    menu.Opened([](auto&& sender, auto&&) {
+        RegisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
         ApplyBlurToAllOpenPopups();
+    });
+    menu.Closed([](auto&& sender, auto&&) {
+        UnregisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
     });
 }
 
@@ -10395,8 +10538,7 @@ void MoveItemWithinPanels(const std::wstring& item, int direction) {
         LoadSettings();
         g_dpiScale = GetBarDpiScale();
         g_barHeightPx = static_cast<int>(g_settings.barHeightDip * g_dpiScale + 0.5);
-        auto content = BuildTopBarContent();
-        g_desktopSource.Content(content);
+        SetTopBarContent(BuildTopBarContent());
         BuildStartContextMenu();
         BuildTaskContextMenu();
         ApplyAllControlStyles();
@@ -10475,6 +10617,12 @@ void AttachTrayReorderMenu(wuxc::Button const& button, std::wstring name) {
             auto flyout = wuxc::Flyout();
             flyout.Content(wrap);
             flyout.ShouldConstrainToRootBounds(false);
+            flyout.Opened([](auto&& sender, auto&&) {
+                RegisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
+            });
+            flyout.Closed([](auto&& sender, auto&&) {
+                UnregisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
+            });
             {
                 Style fpStyle(winrt::xaml_typename<wuxc::FlyoutPresenter>());
                 fpStyle.Setters().Append(Setter(wuxc::Control::BackgroundProperty(),
@@ -10786,8 +10934,7 @@ void PopulateSettingsPanel() {
     applyBtn.Padding(Thickness{10, 8, 10, 8});
     applyBtn.Content(MakeText(nullptr, L"Apply layout now", 12));
     applyBtn.Click([](auto&&, auto&&) {
-        auto content = BuildTopBarContent();
-        g_desktopSource.Content(content);
+        SetTopBarContent(BuildTopBarContent());
         ApplyAllControlStyles();
         ApplyVisibilitySettings();
         StripInheritedIslandBackgrounds();
@@ -10808,8 +10955,7 @@ void PopulateSettingsPanel() {
         Wh_SetStringValue(L"centerItems", g_settings.centerItems.c_str());
         Wh_SetStringValue(L"rightItems",  g_settings.rightItems.c_str());
 
-        auto content = BuildTopBarContent();
-        g_desktopSource.Content(content);
+        SetTopBarContent(BuildTopBarContent());
         ApplyAllControlStyles();
         ApplyVisibilitySettings();
         StripInheritedIslandBackgrounds();
@@ -10861,8 +11007,7 @@ void ScheduleReload() {
             g_dpiScale = GetBarDpiScale();
             g_barHeightPx = static_cast<int>(g_settings.barHeightDip * g_dpiScale + 0.5);
             InstallGlobalMenuResources();
-            auto content = BuildTopBarContent();
-            g_desktopSource.Content(content);
+            SetTopBarContent(BuildTopBarContent());
             BuildStartContextMenu();
             BuildTaskContextMenu();
             ApplyAllControlStyles();
@@ -12610,8 +12755,7 @@ FrameworkElement BuildTopBarContent() {
                 LoadSettings();
                 g_dpiScale = GetBarDpiScale();
                 g_barHeightPx = static_cast<int>(g_settings.barHeightDip * g_dpiScale + 0.5);
-                auto content = BuildTopBarContent();
-                g_desktopSource.Content(content);
+                SetTopBarContent(BuildTopBarContent());
                 BuildStartContextMenu();
                 BuildTaskContextMenu();
                 ApplyAllControlStyles();
@@ -12983,12 +13127,39 @@ g_centerPanel.Children().Append(resourceButton);
 
         wuxc::Flyout weatherFlyout;
         weatherFlyout = MakeControlFlyout(L"WeatherFlyoutRoot", g_weatherPanel);
+        weatherFlyout.Opened([](auto&& sender, auto&&) {
+            RegisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
+        });
+        weatherFlyout.Closed([](auto&& sender, auto&&) {
+            UnregisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
+        });
         weatherFlyout.Opening([](auto&&, auto&&) {
             PopulateWeatherPanel();
             if (!g_settings.weatherLatitude.empty() &&
                 !g_settings.weatherLongitude.empty()) {
                 weather::EnsureFresh();
             }
+            // The TextBox's own Loaded handler runs only once per instance.
+            // If the flyout is closed and reopened, the picker is rebuilt
+            // but focus isn't taken. Re-take it on every open, with a few
+            // retries because the presenter's layout pass may run a tick
+            // or two after Opening fires.
+            auto focusBox = [] {
+                try {
+                    auto it = g_namedElements.find(L"WeatherSearchBox");
+                    if (it == g_namedElements.end()) return;
+                    if (auto box = it->second.try_as<wuxc::TextBox>()) {
+                        box.Focus(FocusState::Programmatic);
+                    }
+                } catch (...) {}
+            };
+            RunOnUiThread([focusBox] {
+                focusBox();
+                RunOnUiThread([focusBox] {
+                    focusBox();
+                    RunOnUiThread([focusBox] { focusBox(); });
+                });
+            });
         });
         weatherFlyout.Closed([](auto&&, auto&&) {
             // Reset picker state so the flyout reopens on the weather card.
@@ -13177,6 +13348,397 @@ RECT GetBarMonitorRect() {
     }
     RECT fallback{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
     return fallback;
+}
+
+HWND FindTopBarFlyoutHwnd() {
+    struct SearchCtx { DWORD pid; HWND result; };
+    SearchCtx ctx{ GetCurrentProcessId(), nullptr };
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<SearchCtx*>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != c->pid) return TRUE;
+        if (hwnd == g_topBarHwnd || hwnd == g_islandHwnd) return TRUE;
+        wchar_t cls[256]{};
+        if (!GetClassName(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
+        if (wcsstr(cls, L"Xaml") && wcsstr(cls, L"Popup")) {
+            c->result = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.result;
+}
+
+void ClipIslandHwndToEmpty() {
+    if (!g_islandHwnd) return;
+    HRGN empty = CreateRectRgn(0, 0, 0, 0);
+    if (empty) {
+        SetWindowRgn(g_islandHwnd, empty, TRUE);
+    }
+}
+
+void EnsureTopBarPopupShown();
+
+// Closes whichever control flyout is currently open. Called from the popup
+// subclass on a mouse-down so that a click on the topbar while a child
+// flyout is open dismisses the flyout instead of being swallowed by XAML's
+// light-dismiss routing.
+// Places every XAML popup HWND in our process (the open child flyouts and
+// context menus) directly above the topbar popup in the topmost band. The
+// topbar popup itself is left at HWND_TOPMOST but the child popups are
+// inserted above it, so DWM composites them on top instead of letting the
+// topbar's translucent content dim them.
+void PromoteChildFlyoutPopups() {
+    HWND topBar = g_topBarPopupHwnd;
+    if (!topBar || !IsWindow(topBar)) return;
+
+    struct Ctx { HWND topBar; };
+    Ctx ctx{ topBar };
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        HWND topBarHwnd = reinterpret_cast<Ctx*>(lp)->topBar;
+        if (hwnd == topBarHwnd) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId()) return TRUE;
+        if (hwnd == g_islandHwnd) return TRUE;
+        wchar_t cls[256]{};
+        if (!GetClassName(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
+        // Only touch XAML windowed popups.
+        if (!(wcsstr(cls, L"Xaml") && wcsstr(cls, L"Popup"))) return TRUE;
+        // Insert directly above the topbar popup.
+        SetWindowPos(hwnd, topBarHwnd, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                     SWP_NOOWNERZORDER);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+}
+
+// Finds an open XAML popup HWND that is NOT the topbar's own popup. This is
+// the HWND that hosts an open child flyout (Display/Sound/Wi-Fi/etc. or a
+// reorder menu). Activating it is safe: XAML already considers it the current
+// popup, so making it OS-foreground doesn't trigger any teardown.
+HWND FindOpenChildFlyoutHwnd() {
+    HWND topBar = g_topBarPopupHwnd;
+    struct Ctx { HWND topBar; HWND result; };
+    Ctx ctx{ topBar, nullptr };
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (hwnd == c->topBar) return TRUE;
+        if (hwnd == g_islandHwnd) return TRUE;
+        if (hwnd == g_topBarHwnd) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId()) return TRUE;
+        wchar_t cls[256]{};
+        if (!GetClassName(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
+        if (!(wcsstr(cls, L"Xaml") && wcsstr(cls, L"Popup"))) return TRUE;
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        RECT r{};
+        if (!GetWindowRect(hwnd, &r)) return TRUE;
+        if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return TRUE;
+        c->result = hwnd;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.result;
+}
+
+void ResetTopBarPointerState() {
+    // XAML's hover state can get stuck after a popup is forcibly closed.
+    // Replaying a WM_MOUSEMOVE at the current cursor position forces
+    // XAML to re-run its hit-test and re-establish hover.
+    HWND hwnd = g_topBarPopupHwnd;
+    if (!hwnd || !IsWindow(hwnd)) return;
+    POINT pt{};
+    if (!GetCursorPos(&pt)) return;
+    if (!ScreenToClient(hwnd, &pt)) return;
+    PostMessage(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(pt.x, pt.y));
+}
+
+bool CloseAnyOpenChildFlyout() {
+    std::vector<wuxc::Primitives::FlyoutBase> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_openPopupMutex);
+        snapshot = g_openPopups;
+    }
+    if (snapshot.empty()) return false;
+
+    bool any = false;
+    for (auto const& fb : snapshot) {
+        try {
+            if (fb && fb.IsOpen()) {
+                fb.Hide();
+                any = true;
+            }
+        } catch (...) {}
+    }
+    if (any) ResetTopBarPointerState();
+    return any;
+}
+
+// Global WH_MOUSE_LL hook that fires for every mouse click, everywhere.
+// XAML's own light-dismiss doesn't work in this setup because the topbar
+// popup is kept topmost and never loses activation, so clicks outside the
+// child flyout never reach XAML's routing. This hook catches them and
+// dismisses the flyout.
+LRESULT CALLBACK ChildFlyoutMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && g_anyChildFlyoutOpen.load() &&
+        (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN)) {
+        auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        POINT pt = info->pt;
+
+        // If the click landed on one of our own XAML popup HWNDs (the
+        // child flyout itself, a submenu, our topbar popup), let it through
+        // — XAML's own logic handles that case. Only clicks landing on a
+        // different window should dismiss.
+        bool insideOwnXamlPopup = false;
+        HWND hwnd = WindowFromPoint(pt);
+        if (hwnd) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == GetCurrentProcessId()) {
+                wchar_t cls[256]{};
+                GetClassName(hwnd, cls, ARRAYSIZE(cls));
+                if (wcsstr(cls, L"Xaml") && wcsstr(cls, L"Popup")) {
+                    insideOwnXamlPopup = true;
+                }
+            }
+        }
+
+        if (!insideOwnXamlPopup) {
+            RunOnUiThread([] {
+                try { CloseAnyOpenChildFlyout(); } catch (...) {}
+            });
+        }
+    }
+    return CallNextHookEx(g_childFlyoutMouseHook, nCode, wParam, lParam);
+}
+
+void InstallChildFlyoutMouseHook() {
+    if (g_childFlyoutMouseHook) return;
+    g_childFlyoutMouseHook =
+        SetWindowsHookExW(WH_MOUSE_LL, ChildFlyoutMouseHookProc, nullptr, 0);
+    if (!g_childFlyoutMouseHook) {
+        Wh_Log(L"TopBar: SetWindowsHookEx(WH_MOUSE_LL) failed: %u",
+               GetLastError());
+    }
+}
+
+LRESULT CALLBACK TopBarPopupSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
+        if (g_anyChildFlyoutOpen.load()) {
+            // A click on the topbar popup while a child flyout is open. The
+            // child flyout lives in a separate XAML popup; XAML classifies
+            // this click as "outside the flyout" and drops it, leaving the
+            // flyout stuck open. Close the flyout ourselves.
+            //
+            // Critically: do NOT call Flyout::Hide() from inside this
+            // WndProc. XAML is mid-dispatch and reentering it corrupts its
+            // pointer state, which is what caused the topbar to freeze and
+            // stop tracking hover. Defer the close to a dispatcher turn.
+            RunOnUiThread([] {
+                try { CloseAnyOpenChildFlyout(); } catch (...) {}
+            });
+            // Swallow only this one click, so the button under the cursor
+            // doesn't fire on the same gesture that dismissed the flyout.
+            return 0;
+        }
+    }
+    if (msg == WM_DESTROY) {
+        if (g_subclassedPopupHwnd == hwnd) {
+            g_subclassedPopupHwnd = nullptr;
+            g_prevPopupProc = nullptr;
+        }
+    }
+    return CallWindowProc(g_prevPopupProc, hwnd, msg, wParam, lParam);
+}
+
+void InstallPopupSubclass(HWND hwnd) {
+    if (!hwnd || hwnd == g_subclassedPopupHwnd) return;
+    WNDPROC prev = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtr(hwnd, GWLP_WNDPROC,
+                         reinterpret_cast<LONG_PTR>(TopBarPopupSubclassProc)));
+    if (prev) {
+        g_prevPopupProc = prev;
+        g_subclassedPopupHwnd = hwnd;
+        Wh_Log(L"TopBar: popup HWND subclassed: %p", hwnd);
+    }
+}
+
+void PinTopBarFlyoutHwnd() {
+    if (!g_topBarPopupHwnd || !IsWindow(g_topBarPopupHwnd)) {
+        g_topBarPopupHwnd = FindTopBarFlyoutHwnd();
+    }
+    if (!g_topBarPopupHwnd) return;
+
+    // Install the click-close subclass the first time we see the popup HWND.
+    // This does NOT fight XAML's placement — it only intercepts mouse-down
+    // to dismiss a child flyout that XAML has otherwise frozen on. XAML
+    // still owns the popup's position.
+    InstallPopupSubclass(g_topBarPopupHwnd);
+
+    // Re-assert the topbar's topmost placement, then promote any open
+    // child flyout popups above it so they stay visible.
+    SetWindowPos(g_topBarPopupHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (g_anyChildFlyoutOpen.load()) {
+        PromoteChildFlyoutPopups();
+    }
+    ClipIslandHwndToEmpty();
+}
+
+void RepositionTopBarPopup() {
+    if (!g_topBarPopup) return;
+    RECT monitorRect = GetBarMonitorRect();
+    double dpiScale = GetBarDpiScale();
+    double widthDip = (monitorRect.right - monitorRect.left) / dpiScale;
+    double heightDip = static_cast<double>(g_settings.barHeightDip);
+
+    if (g_topBarPopupCanvas) {
+        g_topBarPopupCanvas.Width(widthDip);
+        g_topBarPopupCanvas.Height(heightDip);
+    }
+    if (auto child = g_topBarPopup.Content()) {
+        if (auto fe = child.try_as<FrameworkElement>()) {
+            fe.Width(widthDip);
+            fe.Height(heightDip);
+        }
+    }
+    // Pin immediately; the retry timer already running from
+    // EnsureTopBarPopupShown will keep re-pinning after any XAML re-place pass
+    // triggered by the size change.
+    PinTopBarFlyoutHwnd();
+}
+
+void EnsureTopBarPopupShown() {
+    if (!g_topBarPopup || !g_topBarPopupAnchor) return;
+
+    // Refind the HWND only if we don't have a live cached one. Caching matters
+    // because there may be several Xaml popup HWNDs in the process (control
+    // flyouts, context menus, the Ctrl+D target picker) — once we've claimed
+    // ours, always position that one.
+    if (!g_topBarPopupHwnd || !IsWindow(g_topBarPopupHwnd)) {
+        g_topBarPopupHwnd = FindTopBarFlyoutHwnd();
+    }
+
+    if (!g_topBarPopupHwnd) {
+        // No popup HWND yet. The first ShowAt on a not-yet-rendered XAML tree
+        // silently no-ops; call it again on every tick until the HWND appears.
+        // ShowAt on an already-open flyout is a documented no-op.
+        try {
+            wuxc::Primitives::FlyoutShowOptions opts;
+            // XAML's BottomEdgeAlignedLeft on a 0x0 anchor at island (0,0)
+            // lands the flyout at screen (0, barHeight) instead of (0, 0).
+            // XAML caches that position and uses it for hit-testing and for
+            // anchoring child flyouts, which is why the buttons appeared
+            // unclickable and child flyouts opened one bar-height too low.
+            // Pre-offsetting Position by -barHeightDip makes XAML's own
+            // placement math land the flyout at (0, 0), so its cache
+            // finally agrees with where we put the window.
+            opts.Position(wf::Point{0, -static_cast<float>(g_settings.barHeightDip)});
+            opts.Placement(wuxc::Primitives::FlyoutPlacementMode::BottomEdgeAlignedLeft);
+            g_topBarPopup.ShowAt(g_topBarPopupAnchor, opts);
+        } catch (...) {}
+    } else {
+        // Keep the topbar popup topmost, then promote any open child
+        // flyout popups above it. Suppressing the topmost re-assertion
+        // here (the previous approach) let the topbar popup slide above
+        // the child, which made the flyout appear dim. Promoting the
+        // child restores the correct stacking without touching the
+        // topbar's own z-order.
+        SetWindowPos(g_topBarPopupHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (g_anyChildFlyoutOpen.load()) {
+            PromoteChildFlyoutPopups();
+        }
+    }
+
+    // Always clip the island. Every SetWindowPos / popup churn re-shows it.
+    ClipIslandHwndToEmpty();
+
+    // Keep the tick alive forever. XAML's async placement pass can move the
+    // flyout at any time; re-asserting every 100 ms wins that race.
+    if (!g_topBarPopupRetryTimer) {
+        g_topBarPopupRetryTimer = DispatcherTimer();
+        g_topBarPopupRetryTimer.Interval(std::chrono::milliseconds(500));
+        g_topBarPopupRetryTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
+            try { EnsureTopBarPopupShown(); } catch (...) {}
+        });
+    }
+    g_topBarPopupRetryTimer.Stop();
+    g_topBarPopupRetryTimer.Start();
+}
+
+void SetTopBarContent(FrameworkElement content) {
+    RECT monitorRect = GetBarMonitorRect();
+    double dpiScale = GetBarDpiScale();
+    double widthDip = (monitorRect.right - monitorRect.left) / dpiScale;
+    double heightDip = static_cast<double>(g_settings.barHeightDip);
+
+    if (!g_topBarPopup) {
+        g_topBarPopupCanvas = wuxc::Canvas();
+        g_topBarPopupCanvas.HorizontalAlignment(HorizontalAlignment::Stretch);
+        g_topBarPopupCanvas.VerticalAlignment(VerticalAlignment::Stretch);
+
+        g_topBarPopupAnchor = wuxc::Grid();
+        g_topBarPopupAnchor.Width(0);
+        g_topBarPopupAnchor.Height(0);
+        g_topBarPopupAnchor.HorizontalAlignment(HorizontalAlignment::Left);
+        g_topBarPopupAnchor.VerticalAlignment(VerticalAlignment::Top);
+        wuxc::Canvas::SetLeft(g_topBarPopupAnchor, 0);
+        // Move the anchor up by the bar height so XAML's own placement
+        // math lands the parent flyout at screen y=0 instead of y=barHeight.
+        // If XAML then caches the right origin, the child-flyout offset
+        // disappears; the subclass in TopBarPopupSubclassProc can then be
+        // retired.
+        wuxc::Canvas::SetTop(g_topBarPopupAnchor, -heightDip);
+        g_topBarPopupCanvas.Children().Append(g_topBarPopupAnchor);
+
+        g_topBarPopup = wuxc::Flyout();
+        g_topBarPopup.ShouldConstrainToRootBounds(false);
+        g_topBarPopup.AllowFocusOnInteraction(false);
+        g_topBarPopup.AllowFocusWhenDisabled(false);
+        g_topBarPopup.Closing([](wuxc::Primitives::FlyoutBase const&,
+                                 wuxc::Primitives::FlyoutBaseClosingEventArgs const& args) {
+            if (!g_topBarAllowClose) {
+                args.Cancel(true);
+            }
+        });
+
+        Style presenterStyle(winrt::xaml_typename<wuxc::FlyoutPresenter>());
+        presenterStyle.Setters().Append(Setter(wuxc::Control::BackgroundProperty(),
+            winrt::box_value(MakeBrush(0, 0, 0, 0))));
+        presenterStyle.Setters().Append(Setter(wuxc::Control::BorderBrushProperty(),
+            winrt::box_value(MakeBrush(0, 0, 0, 0))));
+        presenterStyle.Setters().Append(Setter(wuxc::Control::BorderThicknessProperty(),
+            winrt::box_value(Thickness{0, 0, 0, 0})));
+        presenterStyle.Setters().Append(Setter(wuxc::Control::PaddingProperty(),
+            winrt::box_value(Thickness{0, 0, 0, 0})));
+        presenterStyle.Setters().Append(Setter(FrameworkElement::MinWidthProperty(),
+            winrt::box_value(0.0)));
+        presenterStyle.Setters().Append(Setter(FrameworkElement::MinHeightProperty(),
+            winrt::box_value(0.0)));
+        presenterStyle.Setters().Append(Setter(FrameworkElement::MaxWidthProperty(),
+            winrt::box_value(std::numeric_limits<double>::infinity())));
+        if (auto tmpl = BuildFlyoutShellTemplate(false)) {
+            presenterStyle.Setters().Append(Setter(wuxc::Control::TemplateProperty(),
+                winrt::box_value(tmpl)));
+        }
+        g_topBarPopup.FlyoutPresenterStyle(presenterStyle);
+
+        g_desktopSource.Content(g_topBarPopupCanvas);
+    }
+
+    content.Width(widthDip);
+    content.Height(heightDip);
+    g_topBarPopup.Content(content);
+
+    // ShowAt on the same tick as content assignment silently no-ops because
+    // the island HWND has zero size at this point. Defer one turn, then
+    // EnsureTopBarPopupShown() will keep retrying via its timer until the
+    // popup HWND actually exists, which is what fixes the "only appears
+    // after a settings change" behaviour.
+    RunOnUiThread([] { EnsureTopBarPopupShown(); });
 }
 
 double GetBarDpiScale() {
@@ -13484,6 +14046,9 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
             // exactly the black rectangle behind the bar.
             return 1;
 
+        // (WM_NCHITTEST deliberately not handled — the popup HWND will be
+        // moved to (0,0) and will be the topmost window at that point.)
+
         case WM_APPBAR_CALLBACK:
             switch (wParam) {
                 case ABN_POSCHANGED:
@@ -13524,10 +14089,30 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
                             isFullscreen = verified;
                         }
                         g_fullScreenAppActive = isFullscreen;
-                        SetWindowPos(hwnd,
-                                     isFullscreen ? HWND_NOTOPMOST : HWND_TOPMOST,
-                                     0, 0, 0, 0,
-                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        if (isFullscreen) {
+                            // Hide the bar and its popup so nothing peeks
+                            // above or behind the fullscreen app. The
+                            // AppBar reservation is independent of
+                            // visibility and stays in place, so maximized
+                            // windows still respect the strip after the
+                            // app exits.
+                            if (g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+                                ShowWindow(g_topBarPopupHwnd, SW_HIDE);
+                            }
+                            ShowWindow(hwnd, SW_HIDE);
+                        } else {
+                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                            if (g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+                                ShowWindow(g_topBarPopupHwnd, SW_SHOWNOACTIVATE);
+                            }
+                            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            if (g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+                                SetWindowPos(g_topBarPopupHwnd, HWND_TOPMOST,
+                                             0, 0, 0, 0,
+                                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            }
+                        }
                     }
                     break;
             }
@@ -13545,6 +14130,7 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
                 SetWindowPos(g_islandHwnd, nullptr, 0, 0, LOWORD(lParam), HIWORD(lParam),
                              SWP_NOZORDER | SWP_SHOWWINDOW);
             }
+            RepositionTopBarPopup();
             return 0;
 
         case WM_DISPLAYCHANGE:
@@ -13552,6 +14138,7 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
             g_dpiScale = GetBarDpiScale();
             g_barHeightPx = static_cast<int>(g_settings.barHeightDip * g_dpiScale + 0.5);
             PositionAppBar(hwnd, g_barHeightPx);
+            RepositionTopBarPopup();
             RefreshTaskList(true);
         RefreshBluetoothRadioState(); // initial radio state
             return 0;
@@ -13573,6 +14160,12 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
             return 0;
 
         case WM_HOTKEY:
+            // Before the bar's flyout host exists, ToggleFlyout / ShowAt on a
+            // not-yet-parented element hard-crashes the island. Refuse the
+            // hotkey until the popup is actually open.
+            if (!g_topBarPopup || !g_topBarPopup.IsOpen() || !g_rootElement) {
+                return 0;
+            }
             switch (wParam) {
                 case HOTKEY_ID_DISPLAY:
                     ToggleFlyout(g_displayFlyout, g_displayButton);
@@ -13677,9 +14270,11 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         case WM_WINDOWPOSCHANGING:
             {
                 WINDOWPOS* wp = reinterpret_cast<WINDOWPOS*>(lParam);
-                // Block hide whenever not shutting down. Fullscreen apps should
-                // cover the bar via z-order, never hide it.
-                if ((wp->flags & SWP_HIDEWINDOW) && !g_allowHide) {
+                // Block hide whenever not shutting down and not fullscreen.
+                // When a fullscreen app takes over we intentionally hide,
+                // so the hide must be allowed through in that case.
+                if ((wp->flags & SWP_HIDEWINDOW) && !g_allowHide &&
+                    !g_fullScreenAppActive) {
                     wp->flags &= ~SWP_HIDEWINDOW; // cancel the hide
                 }
             }
@@ -13881,8 +14476,7 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         // they are created.
         InstallGlobalMenuResources();
 
-        auto content = BuildTopBarContent();
-        g_desktopSource.Content(content);
+        SetTopBarContent(BuildTopBarContent());
         
         // Make the XAML island background transparent so the system blur shows through.
         auto xamlSourceUnknown = g_desktopSource.as<::IUnknown>();
@@ -13943,6 +14537,8 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         // A moment later, so the shell has finished its own start-up layout pass
         // and doesn't immediately overwrite our reservation.
         SetTimer(g_topBarHwnd, kAppBarInitTimerId, 800, nullptr);
+
+        InstallChildFlyoutMouseHook();
 
         ForegroundEventProcInstall();
 
@@ -14013,18 +14609,24 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
                     return;
                 }
 
-                // Always ensure visible.
-                if (IsIconic(g_topBarHwnd)) {
-                    ShowWindow(g_topBarHwnd, SW_RESTORE);
-                }
-                BOOL cloaked = FALSE;
-                if (SUCCEEDED(DwmGetWindowAttribute(g_topBarHwnd, DWMWA_CLOAKED,
-                                                    &cloaked, sizeof(cloaked))) &&
-                    cloaked) {
-                    DwmSetWindowAttribute(g_topBarHwnd, DWMWA_CLOAK, FALSE, sizeof(BOOL));
-                }
-                if (!IsWindowVisible(g_topBarHwnd)) {
-                    ShowWindow(g_topBarHwnd, SW_SHOWNOACTIVATE);
+                // Only ensure-visible while not in fullscreen. The flag
+                // reflects the previous tick's classification, which is
+                // what keeps us from fighting the fullscreen app for one
+                // tick after it takes over.
+                if (!g_fullScreenAppActive) {
+                    if (IsIconic(g_topBarHwnd)) {
+                        ShowWindow(g_topBarHwnd, SW_RESTORE);
+                    }
+                    BOOL cloaked = FALSE;
+                    if (SUCCEEDED(DwmGetWindowAttribute(g_topBarHwnd, DWMWA_CLOAKED,
+                                                        &cloaked, sizeof(cloaked))) &&
+                        cloaked) {
+                        DwmSetWindowAttribute(g_topBarHwnd, DWMWA_CLOAK,
+                                              FALSE, sizeof(BOOL));
+                    }
+                    if (!IsWindowVisible(g_topBarHwnd)) {
+                        ShowWindow(g_topBarHwnd, SW_SHOWNOACTIVATE);
+                    }
                 }
 
                 // Classify the current foreground window.
@@ -14063,17 +14665,39 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
                 s_lastRestoreFg = fg;
                 s_lastRestoreClass = currentClass;
 
+                HWND flyoutHwnd = FindTopBarFlyoutHwnd();
+                if (flyoutHwnd) {
+                    HWND insertAfter = fullscreenFg
+                                           ? fg
+                                           : (desktopFg ? HWND_TOPMOST : HWND_TOPMOST);
+                    SetWindowPos(flyoutHwnd, insertAfter, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                                 SWP_NOOWNERZORDER);
+                }
+                // Promote open child flyout popups above the topbar so
+                // they don't render dim under its translucent plate.
+                if (g_anyChildFlyoutOpen.load()) {
+                    PromoteChildFlyoutPopups();
+                }
+
                 if (classChanged) {
                     if (fullscreenFg) {
-                        // Place the bar DIRECTLY BEHIND the fullscreen window.
-                        // Works whether the fullscreen app is topmost or not.
+                        // Hide the bar and its popup so nothing peeks above
+                        // or behind the fullscreen app. The AppBar
+                        // reservation stays in place, so maximized windows
+                        // still stop below the strip when the app exits.
                         g_fullScreenAppActive = true;
-                        SetWindowPos(g_topBarHwnd, fg, 0, 0, 0, 0,
-                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
-                                     SWP_NOOWNERZORDER);
+                        if (g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+                            ShowWindow(g_topBarPopupHwnd, SW_HIDE);
+                        }
+                        ShowWindow(g_topBarHwnd, SW_HIDE);
                     } else if (desktopFg) {
                         // Win+D: re-stack above the desktop (which is itself topmost).
                         g_fullScreenAppActive = false;
+                        ShowWindow(g_topBarHwnd, SW_SHOWNOACTIVATE);
+                        if (g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+                            ShowWindow(g_topBarPopupHwnd, SW_SHOWNOACTIVATE);
+                        }
                         SetWindowPos(g_topBarHwnd, HWND_BOTTOM, 0, 0, 0, 0,
                                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                         SetWindowPos(g_topBarHwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -14081,10 +14705,19 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
                     } else {
                         // Normal window foreground: keep ourselves above it.
                         g_fullScreenAppActive = false;
+                        ShowWindow(g_topBarHwnd, SW_SHOWNOACTIVATE);
+                        if (g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+                            ShowWindow(g_topBarPopupHwnd, SW_SHOWNOACTIVATE);
+                        }
                         SetWindowPos(g_topBarHwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     }
+                    RepositionTopBarPopup();
                 }
+
+                // Re-clip and re-pin. Both are one-liners and safe to spam.
+                ClipIslandHwndToEmpty();
+                PinTopBarFlyoutHwnd();
 
                 // Reposition if drifted.
                 RECT wanted = GetBarMonitorRect();
@@ -14133,6 +14766,10 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         topbar_settings_window::DestroySettingsWindowNow();
 
         // The topbar has been closed. Stop the foreground hook first (same thread).
+        if (g_childFlyoutMouseHook) {
+            UnhookWindowsHookEx(g_childFlyoutMouseHook);
+            g_childFlyoutMouseHook = nullptr;
+        }
         if (g_foregroundHook) {
             UnhookWinEvent(g_foregroundHook);
             g_foregroundHook = nullptr;
@@ -14201,6 +14838,23 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
                 g_rootElement = nullptr;
             } catch (...) {}
         }
+        if (g_topBarPopupRetryTimer) {
+            g_topBarPopupRetryTimer.Stop();
+            g_topBarPopupRetryTimer = nullptr;
+        }
+        g_topBarPopupShowAtCalled = false;
+        g_topBarPopupHwnd = nullptr;
+        g_subclassedPopupHwnd = nullptr;
+        g_prevPopupProc = nullptr;
+        if (g_topBarPopup) {
+            try {
+                g_topBarAllowClose = true;
+                g_topBarPopup.Hide();
+            } catch (...) {}
+            g_topBarPopup = nullptr;
+        }
+        g_topBarPopupCanvas = nullptr;
+        g_topBarPopupAnchor = nullptr;
         if (g_desktopSource) {
             try {
                 g_desktopSource.Content(nullptr);
@@ -14458,8 +15112,7 @@ void WhTool_ModSettingsChanged() {
         // The whole tree is rebuilt: corner radius, icon colour and the task
         // button layout are all baked in at construction time.
         InstallGlobalMenuResources();
-        auto content = BuildTopBarContent();
-        g_desktopSource.Content(content);
+        SetTopBarContent(BuildTopBarContent());
         BuildStartContextMenu();
         BuildTaskContextMenu();
         BuildAppTitleContextMenu();
