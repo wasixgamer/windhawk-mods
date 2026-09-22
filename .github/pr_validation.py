@@ -5,11 +5,13 @@ PURPOSE:     Verifies the mod information in the modified mods.
 COPYRIGHT:   Copyright 2023 Mark Jansen <mark.jansen@reactos.org>
 '''
 
+import http.client
 import json
 import math
 import os
 import re
 import sys
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -84,6 +86,22 @@ CALLBACK_SIGNATURES: dict[str, list[str]] = {
     'WhTool_ModSettingsChanged': ['void WhTool_ModSettingsChanged()'],
     'WhTool_ModEntryPoint': ['void WhTool_ModEntryPoint()'],
 }
+
+
+# A tool mod runs in Windhawk's own processes rather than being injected into
+# other programs. Its Windhawk targets must be exactly one of these sets.
+TOOL_MOD_ALLOWED_INCLUDES = [
+    ['windhawk.exe'],
+    ['windhawk.exe', 'windhawk-mod.exe'],
+    ['windhawk.exe', 'windhawk-mod.exe', 'windhawk-mod-uiaccess.exe'],
+    ['windhawk.exe', 'windhawk-mod.exe', 'windhawk-mod-elevated.exe'],
+    [
+        'windhawk.exe',
+        'windhawk-mod.exe',
+        'windhawk-mod-uiaccess.exe',
+        'windhawk-mod-elevated.exe',
+    ],
+]
 
 
 # RFC 3986 unreserved and reserved characters, plus % for percent-encoding.
@@ -209,18 +227,50 @@ def get_mod_file_metadata(
     return properties, warnings
 
 
+FETCH_ATTEMPTS = 3
+
+
+class FetchError(Exception):
+    """A fetch failed even after retries, most likely due to a transient network
+    problem rather than anything in the mod being validated."""
+
+
+def fetch_url(url: str) -> bytes:
+    """Fetch a URL, retrying connection errors and 5xx responses. 4xx responses
+    are raised as HTTPError right away so callers can treat 404 as "not found"."""
+    last_error: Optional[Exception] = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url) as response:
+                return response.read()
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise
+            last_error = e
+        except (OSError, http.client.HTTPException) as e:
+            last_error = e
+
+        if attempt < FETCH_ATTEMPTS:
+            print(f'Fetching {url} failed ({last_error!r}), retrying...')
+            time.sleep(2)
+
+    raise FetchError(
+        f'Failed to fetch {url} after {FETCH_ATTEMPTS} attempts ({last_error!r}).'
+        ' This is most likely a temporary network error unrelated to the mod'
+        ' itself, re-run the workflow to try again.'
+    )
+
+
 @cache
 def get_mod_author_data():
     url = 'https://raw.githubusercontent.com/ramensoftware/windhawk-mods/refs/heads/pages/mod_author_data.json'
-    response = urllib.request.urlopen(url).read()
-    return json.loads(response)
+    return json.loads(fetch_url(url))
 
 
 @cache
 def get_valid_license_identifiers_lowercase():
     url = 'https://spdx.org/licenses/licenses.json'
-    response = urllib.request.urlopen(url).read()
-    data = json.loads(response)
+    data = json.loads(fetch_url(url))
     return {license['licenseId'].lower() for license in data['licenses']}
 
 
@@ -233,8 +283,7 @@ def get_existing_mod_metadata(mod_id: str) -> Optional[dict]:
     """Fetch existing mod metadata from mods.windhawk.net, or None if mod doesn't exist."""
     try:
         url = f'https://raw.githubusercontent.com/ramensoftware/windhawk-mods/refs/heads/pages/mods/{urllib.parse.quote(mod_id)}.wh.cpp'
-        response = urllib.request.urlopen(url)
-        content = response.read().decode('utf-8')
+        content = fetch_url(url).decode('utf-8')
 
         # Use existing robust metadata parser (no warnings needed for existing mods)
         properties, _ = get_mod_file_metadata(StringIO(content), warn_callback=None)
@@ -258,8 +307,7 @@ def get_existing_mod_versions(mod_id: str) -> Optional[list[str]]:
     """Fetch list of existing versions for a mod, or None if mod doesn't exist."""
     try:
         url = f'https://raw.githubusercontent.com/ramensoftware/windhawk-mods/refs/heads/pages/mods/{urllib.parse.quote(mod_id)}/versions.json'
-        response = urllib.request.urlopen(url)
-        data = json.loads(response.read())
+        data = json.loads(fetch_url(url))
         return [item['version'] for item in data]
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -346,10 +394,12 @@ class ModMetadataValidator:
         path: Path,
         properties: dict[ModPropertyKey, ModPropertyValue],
         expected_author: str,
+        mod_source: str,
     ):
         self.ctx = ValidationContext(path)
         self.properties = properties
         self.expected_author = expected_author
+        self.mod_source = mod_source
         self.mod_author_data = get_mod_author_data()
 
         # Extract mod ID and fetch existing mod data
@@ -413,6 +463,7 @@ class ModMetadataValidator:
         self.validate_name()
         self.validate_description()
         self.validate_architecture()
+        self.validate_tool_mod()
 
         return self.ctx.warning_count()
 
@@ -725,6 +776,35 @@ class ModMetadataValidator:
         if msg:
             prop.warn(msg.rstrip('\n'))
 
+    def validate_tool_mod(self):
+        """Validate the metadata of a tool mod: one that targets windhawk.exe
+        with a WhTool_ModInit entry point, or any windhawk-*.exe process."""
+        prop = self.property('include')
+        if not prop:
+            return
+
+        includes = {x.lower() for x in prop.value.split('\n') if x != ''}
+        windhawk_includes = {
+            x for x in includes if re.fullmatch(r'windhawk(-[\w-]+)?\.exe', x)
+        }
+        is_tool_mod = any(x != 'windhawk.exe' for x in windhawk_includes) or (
+            'windhawk.exe' in windhawk_includes
+            and re.search(r'\bWhTool_ModInit\b', self.mod_source) is not None
+        )
+        if not is_tool_mod:
+            return
+
+        if windhawk_includes not in [set(x) for x in TOOL_MOD_ALLOWED_INCLUDES]:
+            prop.warn(
+                'Tool mods must @@ exactly one of the following combinations of'
+                ' Windhawk processes:\n'
+                + '\n'.join(f'* {", ".join(x)}' for x in TOOL_MOD_ALLOWED_INCLUDES)
+            )
+
+        arch_prop = self.property('architecture')
+        if arch_prop:
+            arch_prop.warn('@@ must not be specified for tool mods')
+
 
 def validate_metadata(path: Path, mod_source: str, expected_author: str) -> int:
     properties, initial_warnings = get_mod_file_metadata(
@@ -733,7 +813,7 @@ def validate_metadata(path: Path, mod_source: str, expected_author: str) -> int:
     )
 
     # Validate metadata properties
-    validator = ModMetadataValidator(path, properties, expected_author)
+    validator = ModMetadataValidator(path, properties, expected_author, mod_source)
     metadata_warnings = validator.validate_all()
 
     # Validate file path
@@ -1234,8 +1314,7 @@ def get_all_mod_names() -> dict[str, str]:
 @cache
 def get_existing_windows_file_names():
     url = 'https://winbindex.m417z.com/data/filenames.json'
-    response = urllib.request.urlopen(url).read()
-    return json.loads(response)
+    return json.loads(fetch_url(url))
 
 
 def is_existing_windows_file_name(name: str):
@@ -1381,7 +1460,9 @@ def validate_specific_keywords(path: Path, mod_source: str):
                     continue
 
                 warnings += add_warning(
-                    path, line_num, f'Line requires manual inspection for "{word}": {description}'
+                    path,
+                    line_num,
+                    f'Line requires manual inspection for "{word}": {description}',
                 )
 
         hidden_ws = [
@@ -1449,18 +1530,31 @@ def validate_callback_signatures(path: Path, mod_source: str):
             assert m, sig
             expected.append((m.group(1), normalize_callback_param_types(m.group(2))))
 
-        # Match: previous word + whitespace + callback name + ( params ). The
-        # previous-word check naturally skips function calls (e.g. "= Wh_Mod..."
-        # or "(Wh_Mod...") since those aren't preceded by a bare identifier.
-        pattern = r'\b(\w+)\s+' + re.escape(callback_name) + r'\s*\(([^)]*)\)'
+        # Match: optional specifiers + return type + callback name + ( params ).
+        # Requiring a bare identifier before the name naturally skips function
+        # calls (e.g. "= Wh_Mod..." or "(Wh_Mod...").
+        pattern = (
+            r'((?:\b(?:static|extern(?:\s+"C")?|inline)\s+)*)\b(\w+)\s+'
+            + re.escape(callback_name)
+            + r'\s*\(([^)]*)\)'
+        )
         for match in re.finditer(pattern, mod_source):
             # Skip if inside a single-line comment.
             line_start = mod_source.rfind('\n', 0, match.start()) + 1
             if '//' in mod_source[line_start : match.start()]:
                 continue
 
-            return_type = match.group(1)
-            params = match.group(2)
+            line_num = 1 + mod_source[: match.start()].count('\n')
+            specifiers, return_type, params = match.groups()
+
+            if specifiers:
+                warnings += add_warning(
+                    path,
+                    line_num,
+                    f'Unexpected "{" ".join(specifiers.split())}" before'
+                    f' {callback_name}',
+                )
+
             normalized_return_type = normalize_return_type(return_type)
             normalized_params = normalize_callback_param_types(params)
 
@@ -1470,7 +1564,6 @@ def validate_callback_signatures(path: Path, mod_source: str):
             ):
                 continue
 
-            line_num = 1 + mod_source[: match.start()].count('\n')
             expected_list = ' or '.join(f'"{s}"' for s in expected_signatures)
             warnings += add_warning(
                 path,
@@ -1512,6 +1605,49 @@ def test_run():
         print(f'Got {warnings} warnings')
 
 
+def validate_pr_changelog(pr_body: str) -> int:
+    """Mod updates must describe the changes in the PR description."""
+    markers_re = re.compile(
+        r'<!--\s*changelog:start\s*-->(.*?)<!--\s*changelog:end\s*-->',
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    # The sample items of the pull request template, which are to be replaced
+    # with the actual changes.
+    placeholder_item_re = re.compile(
+        r'^[ \t]*\*[ \t]*Changelog item \d+\.\.\.[ \t]*$', re.MULTILINE
+    )
+
+    template_hint = (
+        ' See the pull request template'
+        ' (https://github.com/ramensoftware/windhawk-mods/blob/main/.github/pull_request_template.md?plain=1).'
+    )
+
+    matches = markers_re.findall(pr_body)
+    if len(matches) != 1:
+        return add_warning(
+            Path('.github/pull_request_template.md'),
+            1,
+            'Mod updates must have a changelog in the PR description, between a single'
+            ' pair of the "<!-- changelog:start -->" and "<!-- changelog:end -->"'
+            f' markers, found {len(matches)} such pairs.' + template_hint,
+        )
+
+    changelog = placeholder_item_re.sub('', matches[0]).strip()
+    if changelog == '':
+        return add_warning(
+            Path('.github/pull_request_template.md'),
+            1,
+            'The changelog between the "<!-- changelog:start -->" and'
+            ' "<!-- changelog:end -->" markers in the PR description is empty,'
+            ' please describe the changes of this mod update.'
+            + template_hint,
+        )
+
+    print(f'Changelog:\n{changelog}')
+    return 0
+
+
 def main():
     if len(sys.argv) > 1:
         test_run()
@@ -1541,18 +1677,22 @@ def main():
             f'{added_count=} {modified_count=} {all_count=}',
         )
 
-    if added_count != 0:
-        pr_body = os.environ.get('PR_BODY', '')
-        if '## Mod authorship' not in pr_body:
-            warnings += add_warning(
-                Path('.github/pull_request_template.md'),
-                1,
-                'New mod submissions must keep the "## Mod authorship" section from the'
-                ' pull request template'
-                ' (https://github.com/ramensoftware/windhawk-mods/blob/main/.github/pull_request_template.md?plain=1)'
-                ' in the PR description, so reviewers know how the mod was authored.'
-                ' Please restore that section and fill it in.',
-            )
+    # The PR body is sent with CRLF line endings.
+    pr_body = os.environ.get('PR_BODY', '').replace('\r\n', '\n')
+
+    if added_count != 0 and '## Mod authorship' not in pr_body:
+        warnings += add_warning(
+            Path('.github/pull_request_template.md'),
+            1,
+            'New mod submissions must keep the "## Mod authorship" section from the'
+            ' pull request template'
+            ' (https://github.com/ramensoftware/windhawk-mods/blob/main/.github/pull_request_template.md?plain=1)'
+            ' in the PR description, so reviewers know how the mod was authored.'
+            ' Please restore that section and fill it in.',
+        )
+
+    if modified_count != 0:
+        warnings += validate_pr_changelog(pr_body)
 
     for path in paths:
         print(f'Checking {path=}')
@@ -1575,4 +1715,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except FetchError as e:
+        print(f'::error::{e}')
+        sys.exit(1)
