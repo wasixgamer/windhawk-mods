@@ -202,6 +202,7 @@ Any style rule that sets `Background:=<WindhawkBlur .../>` on one of those eleme
 
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Documents.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.Graphics.Effects.h>
 #include <windows.graphics.effects.h>
@@ -959,6 +960,7 @@ wui::Color GetSystemAccentColor() {
 void RefreshTaskList(bool forceIconRegeneration);
 void RefreshApplicationButtons();
 void RunOnUiThread(std::function<void()> work);
+void RunInBackground(std::function<void()> work);
 
 
 void ApplyAllControlStyles();
@@ -1040,6 +1042,7 @@ struct {
     bool showDate = true;
     std::wstring dateFormat = L"📅ddd, MMM dd";
     std::wstring iconColor = L"#FFFFFF";
+    std::wstring fontColor = L"#FFFFFF";
     std::wstring fontFamily;
     bool fontBold = false;
     int globalBlurAmount = 6;
@@ -1123,7 +1126,7 @@ const std::vector<ControlStyleRule>& BuiltInStyles() {
         {L"SearchIcon", {L"Width=20", L"Height=20"}},
         {L"TaskButton",
          {L"Background:=#15ffffff", L"Margin=3,4,3,4", L"Foreground=white"}},
-        {L"ClockText", {L"Foreground=white", L"FontSize=14"}},
+        {L"ClockText", {L"FontSize=14"}},
         {L"ClockButton", {L"Background:=#15ffffff", L"Margin=3,4,6,4"}},
         {L"DisplayButton", {L"Background:=#15ffffff", L"Margin=5,4"}},
         {L"SoundButton", {L"Background:=#15ffffff", L"Margin=5,4"}},
@@ -1375,12 +1378,30 @@ void AdjustTaskButtonWidths() {
     double availableWidth = 0.0;
     if (g_rootElement) {
         double rootWidth = g_rootElement.ActualWidth();
-        double leftWidth = 0.0, rightWidth = 0.0;
+        double leftWidth = 0.0, rightWidth = 0.0, clockWidth = 0.0, centerWidth = 0.0;
         auto leftIt = g_namedElements.find(L"LeftPanel");
         if (leftIt != g_namedElements.end()) leftWidth = leftIt->second.ActualWidth();
         auto rightIt = g_namedElements.find(L"TrayPanel");
         if (rightIt != g_namedElements.end()) rightWidth = rightIt->second.ActualWidth();
-        availableWidth = rootWidth - leftWidth - rightWidth;
+        auto clockIt = g_namedElements.find(L"ClockPanel");
+        if (clockIt != g_namedElements.end()) clockWidth = clockIt->second.ActualWidth();
+        auto centerIt = g_namedElements.find(L"CenterPanel");
+        if (centerIt != g_namedElements.end()) {
+            auto centerFe = centerIt->second;
+            if (centerFe && centerFe.Visibility() == Visibility::Visible &&
+                centerFe.ActualWidth() > 0) {
+                centerWidth = centerFe.ActualWidth();
+            }
+        }
+        double columnRight = rootWidth - rightWidth - clockWidth;
+        double availableRight = columnRight;
+        if (centerWidth > 0) {
+            double centerLeft = (rootWidth - centerWidth) / 2.0;
+            if (centerLeft < columnRight) {
+                availableRight = centerLeft;
+            }
+        }
+        availableWidth = availableRight - leftWidth;
     } else {
         availableWidth = g_taskListPanel.ActualWidth(); // fallback
     }
@@ -2533,6 +2554,31 @@ void ApplyVisibilitySettings() {
 // Uses Windows' own native date/time format-picture tokens, so token
 // substitution, locale awareness, and pass-through of anything that isn't a
 // recognized format letter -- including emoji -- all come for free.
+std::wstring ForceTextPresentation(std::wstring s) {
+    std::wstring out;
+    out.reserve(s.size() + 8);
+    for (size_t i = 0; i < s.size(); i++) {
+        wchar_t c = s[i];
+        if (c == 0xFE0F) {
+            out.push_back(0xFE0E);
+            continue;
+        }
+        out.push_back(c);
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.size() &&
+            s[i + 1] >= 0xDC00 && s[i + 1] <= 0xDFFF) {
+            out.push_back(s[i + 1]);
+            i++;
+            if (i + 1 < s.size() && (s[i + 1] == 0xFE0E || s[i + 1] == 0xFE0F)) {
+                out.push_back(0xFE0E);
+                i++;
+            } else {
+                out.push_back(0xFE0E);
+            }
+        }
+    }
+    return out;
+}
+
 std::wstring FormatClockText() {
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -2555,7 +2601,112 @@ std::wstring FormatClockText() {
             result += buf;
         }
     }
+    return ForceTextPresentation(result);
+}
+
+std::wstring GetEffectiveIconColorString();
+wuxm::SolidColorBrush MakeBrush(uint8_t a, uint8_t r, uint8_t g, uint8_t b);
+
+bool IsEmojiCodepoint(uint32_t cp) {
+    return (cp >= 0x1F000 && cp <= 0x1FAFF) ||
+           (cp >= 0x2600 && cp <= 0x26FF) ||
+           (cp >= 0x2700 && cp <= 0x27BF) ||
+           (cp >= 0x2B00 && cp <= 0x2BFF);
+}
+
+uint32_t ReadUtf16Codepoint(const std::wstring& s, size_t& i) {
+    wchar_t c = s[i];
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.size() &&
+        s[i + 1] >= 0xDC00 && s[i + 1] <= 0xDFFF) {
+        uint32_t cp = 0x10000 + ((static_cast<uint32_t>(c) - 0xD800) << 10) +
+                      (static_cast<uint32_t>(s[i + 1]) - 0xDC00);
+        i += 2;
+        return cp;
+    }
+    i++;
+    return static_cast<uint32_t>(c);
+}
+
+struct ClockSegment {
+    std::wstring text;
+    bool isEmoji = false;
+};
+
+std::vector<ClockSegment> SegmentClockText(const std::wstring& s) {
+    std::vector<ClockSegment> result;
+    if (s.empty()) {
+        return result;
+    }
+    size_t start = 0;
+    size_t i = 0;
+    bool currentIsEmoji = false;
+    bool first = true;
+    while (i < s.size()) {
+        size_t segStart = i;
+        uint32_t cp = ReadUtf16Codepoint(s, i);
+        bool isEmoji = IsEmojiCodepoint(cp);
+        while (i < s.size()) {
+            size_t save = i;
+            uint32_t peek = ReadUtf16Codepoint(s, i);
+            if (peek == 0xFE0E || peek == 0xFE0F) {
+                continue;
+            }
+            if (peek == 0x200D && i < s.size()) {
+                ReadUtf16Codepoint(s, i);
+                continue;
+            }
+            i = save;
+            break;
+        }
+        if (first) {
+            currentIsEmoji = isEmoji;
+            start = segStart;
+            first = false;
+        } else if (isEmoji != currentIsEmoji) {
+            ClockSegment seg;
+            seg.text = s.substr(start, segStart - start);
+            seg.isEmoji = currentIsEmoji;
+            result.push_back(seg);
+            start = segStart;
+            currentIsEmoji = isEmoji;
+        }
+    }
+    if (!first) {
+        ClockSegment seg;
+        seg.text = s.substr(start);
+        seg.isEmoji = currentIsEmoji;
+        result.push_back(seg);
+    }
     return result;
+}
+
+void ApplyClockInlines(wuxc::TextBlock const& text, const std::wstring& content) {
+    text.Inlines().Clear();
+
+    wui::Color emojiColor{};
+    const std::wstring emojiHex = GetEffectiveIconColorString();
+    if (!TryParseHexColor(emojiHex, &emojiColor) &&
+        !TryParseNamedColor(emojiHex, &emojiColor)) {
+        emojiColor = wui::ColorHelper::FromArgb(255, 255, 255, 255);
+    }
+
+    wui::Color textColor{};
+    if (!TryParseHexColor(g_settings.fontColor, &textColor) &&
+        !TryParseNamedColor(g_settings.fontColor, &textColor)) {
+        textColor = wui::ColorHelper::FromArgb(255, 255, 255, 255);
+    }
+
+    for (const auto& seg : SegmentClockText(content)) {
+        winrt::Windows::UI::Xaml::Documents::Run run;
+        run.Text(winrt::hstring(seg.text));
+        wui::Color c = seg.isEmoji ? emojiColor : textColor;
+        run.Foreground(MakeBrush(c.A, c.R, c.G, c.B));
+        if (seg.isEmoji) {
+            run.FontFamily(wuxm::FontFamily(L"Segoe UI Emoji"));
+            run.FontWeight(winrt::Windows::UI::Text::FontWeights::Normal());
+        }
+        text.Inlines().Append(run);
+    }
 }
 
 // ============================================================================
@@ -2893,6 +3044,34 @@ FrameworkElement BuildBatteryIcon(double displaySize, int percentage, bool charg
     }
 }
 
+FrameworkElement BuildRecycleBinIcon(double displaySize) {
+    std::wstring brush = GetEffectiveIconColorString();
+    std::wstring data =
+        L"F0 "
+        L"M3,5 L21,5 L21,7 L3,7 Z "
+        L"M9,3 L15,3 L15,5 L9,5 Z "
+        L"M5,8 L19,8 L17.6,21 L6.4,21 Z "
+        L"M8.6,10.6 L9.9,10.6 L10.8,18.6 L9.5,18.6 Z "
+        L"M11.35,10.6 L12.65,10.6 L12.65,18.6 L11.35,18.6 Z "
+        L"M14.1,10.6 L15.4,10.6 L14.5,18.6 L13.2,18.6 Z";
+    std::wstring xaml =
+        L"<Viewbox xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" "
+        L"Stretch=\"Uniform\" Width=\"" + std::to_wstring(displaySize) + L"\" Height=\"" +
+        std::to_wstring(displaySize) + L"\">"
+        L"<Grid Width=\"24\" Height=\"24\">"
+        L"<Path Data=\"" + data + L"\" Fill=\"" + brush + L"\"/>"
+        L"</Grid></Viewbox>";
+    try {
+        auto element = Markup::XamlReader::Load(xaml).as<FrameworkElement>();
+        element.Name(L"RecycleBinIcon");
+        return element;
+    } catch (winrt::hresult_error const& ex) {
+        Wh_Log(L"Failed to build recycle bin icon: %08X",
+               static_cast<unsigned int>(ex.code().value));
+        return nullptr;
+    }
+}
+
 // ============================================================================
 // Shared WinUI-flavoured building blocks
 // ============================================================================
@@ -2930,7 +3109,6 @@ wuxc::TextBlock MakeText(PCWSTR name, std::wstring_view text, double size, bool 
     block.Text(winrt::hstring(text));
     block.FontSize(size);
 
-    // Global font family / weight chosen in the settings window.
     if (!g_settings.fontFamily.empty()) {
         try {
             block.FontFamily(wuxm::FontFamily(winrt::hstring(g_settings.fontFamily)));
@@ -2938,6 +3116,13 @@ wuxc::TextBlock MakeText(PCWSTR name, std::wstring_view text, double size, bool 
     }
     if (bold || g_settings.fontBold) {
         block.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+    }
+    if (!g_settings.fontColor.empty()) {
+        wui::Color fontColor{};
+        if (TryParseHexColor(g_settings.fontColor, &fontColor) ||
+            TryParseNamedColor(g_settings.fontColor, &fontColor)) {
+            block.Foreground(MakeBrush(fontColor.A, fontColor.R, fontColor.G, fontColor.B));
+        }
     }
     block.Opacity(opacity);
     block.VerticalAlignment(VerticalAlignment::Center);
@@ -3121,14 +3306,24 @@ wuxm::Imaging::BitmapImage HIconToBitmapImage(HICON hIcon, UINT size) {
         }
     }
 
-    BITMAPFILEHEADER fileHeader{};
-    fileHeader.bfType = 0x4D42;  // "BM"
-    fileHeader.bfSize = static_cast<DWORD>(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) +
-                                           dataSize);
-    fileHeader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    BITMAPV5HEADER infoHeader{};
+    infoHeader.bV5Size = sizeof(BITMAPV5HEADER);
+    infoHeader.bV5Width = static_cast<LONG>(size);
+    infoHeader.bV5Height = -static_cast<LONG>(size);
+    infoHeader.bV5Planes = 1;
+    infoHeader.bV5BitCount = 32;
+    infoHeader.bV5Compression = BI_BITFIELDS;
+    infoHeader.bV5RedMask = 0x00FF0000;
+    infoHeader.bV5GreenMask = 0x0000FF00;
+    infoHeader.bV5BlueMask = 0x000000FF;
+    infoHeader.bV5AlphaMask = 0xFF000000;
+    infoHeader.bV5CSType = LCS_sRGB;
+    infoHeader.bV5SizeImage = dataSize;
 
-    BITMAPINFOHEADER infoHeader = bmi.bmiHeader;
-    infoHeader.biSizeImage = dataSize;
+    BITMAPFILEHEADER fileHeader{};
+    fileHeader.bfType = 0x4D42;
+    fileHeader.bfSize = static_cast<DWORD>(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPV5HEADER) + dataSize);
+    fileHeader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPV5HEADER);
 
     try {
         winrt::Windows::Storage::Streams::InMemoryRandomAccessStream stream;
@@ -3143,8 +3338,6 @@ wuxm::Imaging::BitmapImage HIconToBitmapImage(HICON hIcon, UINT size) {
         stream.Seek(0);
 
         wuxm::Imaging::BitmapImage bitmapImage;
-        // Fire-and-forget: blocking on .get() here would risk this UI thread
-        // waiting on its own dispatcher to pump the completion.
         bitmapImage.SetSourceAsync(stream);
         return bitmapImage;
     } catch (winrt::hresult_error const& ex) {
@@ -3461,6 +3654,9 @@ void ActivateTaskWindow(HWND hwnd) {
 
 wuxc::Button CreateTaskButton(HWND hwnd, const std::wstring& title) {
     auto button = MakeGhostButton(L"TaskButton", g_settings.cornerRadius);
+    // See BuildTopBarContent for why topbar-level buttons are removed
+    // from tab navigation.
+    button.IsTabStop(false);
     button.Content(BuildTaskButtonContent(hwnd, title));
     button.MaxWidth(g_settings.taskButtonWidth);  // max width from settings
     button.ClearValue(FrameworkElement::WidthProperty()); // auto width by default
@@ -3539,14 +3735,19 @@ wuxc::Button CreateTaskButton(HWND hwnd, const std::wstring& title) {
                 if (!IsWindow(hwnd)) {
                     return;
                 }
-                ToggleMaximizeWindow(hwnd);
+                // See the equivalent handler in BuildTopBarContent for why
+                // this is deferred to a background thread.
+                RunInBackground([hwnd] {
+                    try { ToggleMaximizeWindow(hwnd); } catch (...) {}
+                });
             } catch (...) {
             }
         });
 
     button.RightTapped(
-        [](wf::IInspectable const& sender, Input::RightTappedRoutedEventArgs const&) {
+        [](wf::IInspectable const& sender, Input::RightTappedRoutedEventArgs const& args) {
             try {
+                args.Handled(true);
                 if (!g_taskContextMenu) {
                     return;
                 }
@@ -3863,6 +4064,7 @@ void RefreshApplicationButtons() {
     g_taskListPanel.Children().Clear();
 
     auto titleBtn = MakeGhostButton(L"AppTitleButton", g_settings.cornerRadius);
+    titleBtn.IsTabStop(false);
     titleBtn.VerticalAlignment(VerticalAlignment::Stretch);
     titleBtn.Margin(Thickness{3, 4, 3, 4});
     titleBtn.Padding(Thickness{10, 0, 10, 0});
@@ -6042,9 +6244,6 @@ void ApplyIconColorToElement(FrameworkElement element, const std::wstring& value
             } else if (auto fi = node.try_as<wuxc::FontIcon>()) {
                 fi.Foreground(brush);
             } else if (auto text = node.try_as<wuxc::TextBlock>()) {
-                // FontIcon's template renders the glyph through an internal
-                // TextBlock. Only recolor that one -- a standalone TextBlock
-                // is a label and follows the text color, not the icon color.
                 if (text.Parent().try_as<wuxc::FontIcon>()) {
                     text.Foreground(brush);
                 }
@@ -8272,19 +8471,23 @@ wuxm::Imaging::BitmapImage Bgra32ToBitmapImage(const std::vector<uint8_t>& pixel
         return nullptr;
     }
 
-    BITMAPINFOHEADER infoHeader{};
-    infoHeader.biSize = sizeof(BITMAPINFOHEADER);
-    infoHeader.biWidth = width;
-    infoHeader.biHeight = -height;  // top-down
-    infoHeader.biPlanes = 1;
-    infoHeader.biBitCount = 32;
-    infoHeader.biCompression = BI_RGB;
-    infoHeader.biSizeImage = static_cast<DWORD>(pixels.size());
+    BITMAPV5HEADER infoHeader{};
+    infoHeader.bV5Size = sizeof(BITMAPV5HEADER);
+    infoHeader.bV5Width = width;
+    infoHeader.bV5Height = -height;
+    infoHeader.bV5Planes = 1;
+    infoHeader.bV5BitCount = 32;
+    infoHeader.bV5Compression = BI_BITFIELDS;
+    infoHeader.bV5RedMask = 0x00FF0000;
+    infoHeader.bV5GreenMask = 0x0000FF00;
+    infoHeader.bV5BlueMask = 0x000000FF;
+    infoHeader.bV5AlphaMask = 0xFF000000;
+    infoHeader.bV5CSType = LCS_sRGB;
+    infoHeader.bV5SizeImage = static_cast<DWORD>(pixels.size());
 
     BITMAPFILEHEADER fileHeader{};
-    fileHeader.bfType = 0x4D42;  // "BM"
-    fileHeader.bfSize = static_cast<DWORD>(sizeof(fileHeader) + sizeof(infoHeader) +
-                                           pixels.size());
+    fileHeader.bfType = 0x4D42;
+    fileHeader.bfSize = static_cast<DWORD>(sizeof(fileHeader) + sizeof(infoHeader) + pixels.size());
     fileHeader.bfOffBits = sizeof(fileHeader) + sizeof(infoHeader);
 
     try {
@@ -9863,9 +10066,16 @@ void ApplyMenuItemLook(wuxc::MenuFlyoutItemBase const& item) {
     }
 }
 
-wuxc::MenuFlyoutItem MakeMenuItem(std::wstring_view text, std::function<void()> onClick) {
+wuxc::MenuFlyoutItem MakeMenuItem(std::wstring_view text, std::function<void()> onClick,
+                                  const wchar_t* glyph = nullptr) {
     wuxc::MenuFlyoutItem item;
     item.Text(winrt::hstring(text));
+    if (glyph && *glyph) {
+        wuxc::FontIcon icon;
+        icon.Glyph(glyph);
+        icon.FontSize(14);
+        item.Icon(icon);
+    }
     if (!g_settings.fontFamily.empty()) {
         try {
             item.FontFamily(wuxm::FontFamily(winrt::hstring(g_settings.fontFamily)));
@@ -9933,9 +10143,16 @@ wuxc::MenuFlyoutItem MakeMenuItem(std::wstring_view text, std::function<void()> 
     return item;
 }
 
-wuxc::MenuFlyoutSubItem MakeMenuSubItem(std::wstring_view text) {
+wuxc::MenuFlyoutSubItem MakeMenuSubItem(std::wstring_view text,
+                                        const wchar_t* glyph = nullptr) {
     wuxc::MenuFlyoutSubItem item;
     item.Text(winrt::hstring(text));
+    if (glyph && *glyph) {
+        wuxc::FontIcon icon;
+        icon.Glyph(glyph);
+        icon.FontSize(14);
+        item.Icon(icon);
+    }
     if (!g_settings.fontFamily.empty()) {
         try {
             item.FontFamily(wuxm::FontFamily(winrt::hstring(g_settings.fontFamily)));
@@ -10066,34 +10283,66 @@ void SuspendSystem() {
     FreeLibrary(module);
 }
 
+void RestartExplorerShell() {
+    HWND tray = FindWindow(L"Shell_TrayWnd", nullptr);
+    DWORD shellPid = 0;
+    if (tray) {
+        GetWindowThreadProcessId(tray, &shellPid);
+    }
+
+    if (shellPid) {
+        HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, shellPid);
+        if (proc) {
+            TerminateProcess(proc, 0);
+            CloseHandle(proc);
+        }
+    }
+
+    RunInBackground([] {
+        for (int i = 0; i < 30; i++) {
+            if (WaitForSingleObject(g_stopEvent, 100) == WAIT_OBJECT_0) return;
+            if (!FindWindow(L"Shell_TrayWnd", nullptr)) break;
+        }
+        ShellExecute(nullptr, L"open", L"explorer.exe", nullptr, nullptr, SW_SHOWNORMAL);
+    });
+}
+
 void BuildStartContextMenu() {
     wuxc::MenuFlyout menu;
     StyleMenuFlyout(menu);
 
     auto items = menu.Items();
-    items.Append(MakeMenuItem(L"TopBar settings…", [] { OpenTopBarSettingsWindow(); }));
+    items.Append(MakeMenuItem(L"TopBar settings…", [] { OpenTopBarSettingsWindow(); },
+                              L"\uE713"));
     items.Append(MakeMenuSeparator());
-    items.Append(MakeMenuItem(L"Task Manager", [] { RunShellCommand(L"taskmgr.exe"); }));
-    items.Append(MakeMenuItem(L"Settings", [] { RunShellCommand(L"ms-settings:"); }));
-    items.Append(MakeMenuItem(L"File Explorer", [] { RunShellCommand(L"explorer.exe"); }));
-    items.Append(MakeMenuItem(L"Search", [] { SendWinKeyChord('S'); }));
-    items.Append(MakeMenuItem(L"Run", [] { SendWinKeyChord('R'); }));
+    items.Append(MakeMenuItem(L"Task Manager", [] { RunShellCommand(L"taskmgr.exe"); },
+                              L"\uE9F9"));
+    items.Append(MakeMenuItem(L"Settings", [] { RunShellCommand(L"ms-settings:"); },
+                              L"\uE713"));
+    items.Append(MakeMenuItem(L"File Explorer", [] { RunShellCommand(L"explorer.exe"); },
+                              L"\uE8B7"));
+    items.Append(MakeMenuItem(L"Search", [] { SendWinKeyChord('S'); }, L"\uE721"));
+    items.Append(MakeMenuItem(L"Run", [] { SendWinKeyChord('R'); }, L"\uE756"));
+    items.Append(MakeMenuItem(L"Restart Explorer",
+                              [] { RestartExplorerShell(); }, L"\uE72C"));
 
     items.Append(MakeMenuSeparator());
 
-    auto powerItem = MakeMenuSubItem(L"Shut down or sign out");
+    auto powerItem = MakeMenuSubItem(L"Shut down or sign out", L"\uE7E8");
     auto powerItems = powerItem.Items();
-    powerItems.Append(
-        MakeMenuItem(L"Sign out", [] { RunShellCommand(L"shutdown.exe", L"/l", true); }));
-    powerItems.Append(MakeMenuItem(L"Sleep", [] { SuspendSystem(); }));
     powerItems.Append(MakeMenuItem(
-        L"Shut down", [] { RunShellCommand(L"shutdown.exe", L"/s /t 0", true); }));
-    powerItems.Append(
-        MakeMenuItem(L"Restart", [] { RunShellCommand(L"shutdown.exe", L"/r /t 0", true); }));
+        L"Sign out", [] { RunShellCommand(L"shutdown.exe", L"/l", true); }, L"\uF3B1"));
+    powerItems.Append(MakeMenuItem(L"Sleep", [] { SuspendSystem(); }, L"\uE708"));
+    powerItems.Append(MakeMenuItem(
+        L"Shut down", [] { RunShellCommand(L"shutdown.exe", L"/s /t 0", true); },
+        L"\uE7E8"));
+    powerItems.Append(MakeMenuItem(
+        L"Restart", [] { RunShellCommand(L"shutdown.exe", L"/r /t 0", true); },
+        L"\uE72C"));
     items.Append(powerItem);
 
     items.Append(MakeMenuSeparator());
-    items.Append(MakeMenuItem(L"Desktop", [] { ShowDesktop(); }));
+    items.Append(MakeMenuItem(L"Desktop", [] { ShowDesktop(); }, L"\uE8FC"));
 
     g_startContextMenu = menu;
 }
@@ -10160,20 +10409,20 @@ void BuildTaskContextMenu() {
         if (g_contextMenuTargetHwnd) {
             ToggleMaximizeWindow(g_contextMenuTargetHwnd);
         }
-    });
+    }, L"\uE740");
     items.Append(g_taskMenuToggleItem);
 
     items.Append(MakeMenuItem(L"Minimize", [] {
         if (g_contextMenuTargetHwnd) {
             ShowWindow(g_contextMenuTargetHwnd, SW_MINIMIZE);
         }
-    }));
+    }, L"\uE921"));
 
     items.Append(MakeMenuItem(L"Bring to front", [] {
         if (g_contextMenuTargetHwnd) {
             ForceForegroundWindow(g_contextMenuTargetHwnd);
         }
-    }));
+    }, L"\uE8A7"));
 
     items.Append(MakeMenuSeparator());
 
@@ -10181,13 +10430,13 @@ void BuildTaskContextMenu() {
         if (g_contextMenuTargetHwnd) {
             OpenFileLocationForApp(g_contextMenuTargetHwnd);
         }
-    }));
+    }, L"\uE838"));
 
     items.Append(MakeMenuItem(L"Properties", [] {
         if (g_contextMenuTargetHwnd) {
             ShowFilePropertiesForApp(g_contextMenuTargetHwnd);
         }
-    }));
+    }, L"\uE713"));
 
     items.Append(MakeMenuSeparator());
 
@@ -10195,7 +10444,7 @@ void BuildTaskContextMenu() {
         if (g_contextMenuTargetHwnd) {
             CloseWindowGracefully(g_contextMenuTargetHwnd);
         }
-    }));
+    }, L"\uE8BB"));
 
     g_taskContextMenu = menu;
 }
@@ -10210,13 +10459,13 @@ void BuildAppTitleContextMenu() {
         if (g_appTitleContextTarget) {
             OpenFileLocationForApp(g_appTitleContextTarget);
         }
-    }));
+    }, L"\uE838"));
 
     items.Append(MakeMenuItem(L"Properties", [] {
         if (g_appTitleContextTarget) {
             ShowFilePropertiesForApp(g_appTitleContextTarget);
         }
-    }));
+    }, L"\uE713"));
 
     g_appTitleContextMenu = menu;
 }
@@ -11057,6 +11306,316 @@ static void ApplyTopBarBackgroundNow() {
     }
 }
 
+struct CompactColorPicker {
+    wuxc::Border Root{nullptr};
+    std::function<wui::Color()> GetColor;
+    std::function<void(wui::Color)> SetColor;
+};
+
+CompactColorPicker BuildCompactColorPicker(wui::Color initial,
+                                           std::function<void(wui::Color)> onChanged) {
+    auto rgbToHsv = [](wui::Color c, double& h, double& s, double& v) {
+        double r = c.R / 255.0, g = c.G / 255.0, b = c.B / 255.0;
+        double mx = (std::max)({r, g, b});
+        double mn = (std::min)({r, g, b});
+        double d = mx - mn;
+        v = mx;
+        s = mx > 0.0 ? d / mx : 0.0;
+        h = 0.0;
+        if (d > 1e-9) {
+            if (mx == r) h = 60.0 * std::fmod((g - b) / d, 6.0);
+            else if (mx == g) h = 60.0 * ((b - r) / d + 2.0);
+            else h = 60.0 * ((r - g) / d + 4.0);
+            if (h < 0.0) h += 360.0;
+        }
+    };
+
+    auto hsvToRgb = [](double hh, double ss, double vv) -> wui::Color {
+        hh = std::fmod(hh, 360.0);
+        if (hh < 0.0) hh += 360.0;
+        double c = vv * ss;
+        double x = c * (1.0 - std::abs(std::fmod(hh / 60.0, 2.0) - 1.0));
+        double m = vv - c;
+        double rr = 0, gg = 0, bb = 0;
+        if (hh < 60) { rr = c; gg = x; bb = 0; }
+        else if (hh < 120) { rr = x; gg = c; bb = 0; }
+        else if (hh < 180) { rr = 0; gg = c; bb = x; }
+        else if (hh < 240) { rr = 0; gg = x; bb = c; }
+        else if (hh < 300) { rr = x; gg = 0; bb = c; }
+        else { rr = c; gg = 0; bb = x; }
+        return wui::ColorHelper::FromArgb(
+            255,
+            static_cast<uint8_t>(std::round((rr + m) * 255.0)),
+            static_cast<uint8_t>(std::round((gg + m) * 255.0)),
+            static_cast<uint8_t>(std::round((bb + m) * 255.0)));
+    };
+
+    constexpr double kSpectrum = 150.0;
+    constexpr double kHueWidth = 16.0;
+    constexpr double kRadius = 8.0;
+
+    double h0, s0, v0;
+    rgbToHsv(initial, h0, s0, v0);
+
+    auto hRef = std::make_shared<double>(h0);
+    auto sRef = std::make_shared<double>(s0);
+    auto vRef = std::make_shared<double>(v0);
+
+    winrt::Windows::UI::Xaml::Shapes::Rectangle hueLayer;
+    hueLayer.Fill(wuxm::SolidColorBrush(hsvToRgb(h0, 1.0, 1.0)));
+
+    winrt::Windows::UI::Xaml::Shapes::Rectangle satLayer;
+    {
+        wuxm::LinearGradientBrush brush;
+        brush.StartPoint({0.0, 0.5});
+        brush.EndPoint({1.0, 0.5});
+        wuxm::GradientStop g0;
+        g0.Offset(0.0);
+        g0.Color(wui::ColorHelper::FromArgb(255, 255, 255, 255));
+        wuxm::GradientStop g1;
+        g1.Offset(1.0);
+        g1.Color(wui::ColorHelper::FromArgb(0, 255, 255, 255));
+        brush.GradientStops().Append(g0);
+        brush.GradientStops().Append(g1);
+        satLayer.Fill(brush);
+    }
+
+    winrt::Windows::UI::Xaml::Shapes::Rectangle valLayer;
+    {
+        wuxm::LinearGradientBrush brush;
+        brush.StartPoint({0.5, 0.0});
+        brush.EndPoint({0.5, 1.0});
+        wuxm::GradientStop g0;
+        g0.Offset(0.0);
+        g0.Color(wui::ColorHelper::FromArgb(0, 0, 0, 0));
+        wuxm::GradientStop g1;
+        g1.Offset(1.0);
+        g1.Color(wui::ColorHelper::FromArgb(255, 0, 0, 0));
+        brush.GradientStops().Append(g0);
+        brush.GradientStops().Append(g1);
+        valLayer.Fill(brush);
+    }
+
+    wuxc::Grid spectrumStack;
+    spectrumStack.Width(kSpectrum);
+    spectrumStack.Height(kSpectrum);
+    spectrumStack.Children().Append(hueLayer);
+    spectrumStack.Children().Append(satLayer);
+    spectrumStack.Children().Append(valLayer);
+
+    winrt::Windows::UI::Xaml::Shapes::Ellipse crosshair;
+    crosshair.Width(12);
+    crosshair.Height(12);
+    crosshair.Stroke(wuxm::SolidColorBrush(wui::ColorHelper::FromArgb(255, 255, 255, 255)));
+    crosshair.StrokeThickness(2);
+    crosshair.IsHitTestVisible(false);
+
+    wuxc::Canvas spectrumCanvas;
+    spectrumCanvas.Width(kSpectrum);
+    spectrumCanvas.Height(kSpectrum);
+    spectrumCanvas.Children().Append(spectrumStack);
+    spectrumCanvas.Children().Append(crosshair);
+
+    auto positionCrosshair = [crosshair, sRef, vRef]() {
+        double x = (*sRef) * kSpectrum;
+        double y = (1.0 - (*vRef)) * kSpectrum;
+        wuxc::Canvas::SetLeft(crosshair, x - 6.0);
+        wuxc::Canvas::SetTop(crosshair, y - 6.0);
+    };
+    positionCrosshair();
+
+    wuxc::Border spectrumBorder;
+    spectrumBorder.Width(kSpectrum);
+    spectrumBorder.Height(kSpectrum);
+    spectrumBorder.CornerRadius(CornerRadius{kRadius, kRadius, kRadius, kRadius});
+    spectrumBorder.Background(MakeSolid(0xFF, 0x00, 0x00, 0x00));
+    spectrumBorder.Child(spectrumCanvas);
+
+    winrt::Windows::UI::Xaml::Shapes::Rectangle hueBar;
+    {
+        wuxm::LinearGradientBrush brush;
+        brush.StartPoint({0.5, 0.0});
+        brush.EndPoint({0.5, 1.0});
+        struct HS { double off; uint8_t r, g, b; };
+        const HS stops[] = {
+            {0.0 / 6.0, 255, 0, 0},
+            {1.0 / 6.0, 255, 255, 0},
+            {2.0 / 6.0, 0, 255, 0},
+            {3.0 / 6.0, 0, 255, 255},
+            {4.0 / 6.0, 0, 0, 255},
+            {5.0 / 6.0, 255, 0, 255},
+            {6.0 / 6.0, 255, 0, 0},
+        };
+        for (auto& st : stops) {
+            wuxm::GradientStop gs;
+            gs.Offset(st.off);
+            gs.Color(wui::ColorHelper::FromArgb(255, st.r, st.g, st.b));
+            brush.GradientStops().Append(gs);
+        }
+        hueBar.Fill(brush);
+    }
+    hueBar.Width(kHueWidth);
+    hueBar.Height(kSpectrum);
+
+    wuxc::Border hueMarker;
+    hueMarker.Width(kHueWidth + 8);
+    hueMarker.Height(12);
+    hueMarker.CornerRadius(CornerRadius{ 6, 6, 6, 6 });
+    hueMarker.Background(wuxm::SolidColorBrush(wui::ColorHelper::FromArgb(255, 255, 255, 255)));
+    hueMarker.BorderBrush(wuxm::SolidColorBrush(wui::ColorHelper::FromArgb(255, 40, 40, 40)));
+    hueMarker.BorderThickness(Thickness{ 1, 1, 1, 1 });
+    hueMarker.IsHitTestVisible(false);
+
+    wuxc::Canvas hueCanvas;
+    hueCanvas.Width(kHueWidth);
+    hueCanvas.Height(kSpectrum);
+    hueCanvas.Children().Append(hueBar);
+    hueCanvas.Children().Append(hueMarker);
+
+    auto positionHueMarker = [hueMarker, hRef]() {
+        double y = ((*hRef) / 360.0) * kSpectrum;
+        constexpr double kMarkerW = kHueWidth + 8;
+        constexpr double kMarkerH = 12;
+        wuxc::Canvas::SetLeft(hueMarker, (kHueWidth - kMarkerW) / 2.0);
+        wuxc::Canvas::SetTop(hueMarker, y - kMarkerH / 2.0);
+    };
+    positionHueMarker();
+
+    wuxc::Border hueBorder;
+    hueBorder.Width(kHueWidth);
+    hueBorder.Height(kSpectrum);
+    hueBorder.CornerRadius(CornerRadius{kRadius, kRadius, kRadius, kRadius});
+    hueBorder.Background(MakeSolid(0xFF, 0x00, 0x00, 0x00));
+    hueBorder.Child(hueCanvas);
+
+    wuxc::Grid layout;
+    layout.ColumnSpacing(6);
+    wuxc::ColumnDefinition col1;
+    col1.Width(GridLength{0, GridUnitType::Auto});
+    wuxc::ColumnDefinition col2;
+    col2.Width(GridLength{0, GridUnitType::Auto});
+    layout.ColumnDefinitions().Append(col1);
+    layout.ColumnDefinitions().Append(col2);
+    wuxc::Grid::SetColumn(spectrumBorder, 0);
+    wuxc::Grid::SetColumn(hueBorder, 1);
+    layout.Children().Append(spectrumBorder);
+    layout.Children().Append(hueBorder);
+
+    auto emit = [hRef, sRef, vRef, hsvToRgb, onChanged]() {
+        if (onChanged) {
+            onChanged(hsvToRgb(*hRef, *sRef, *vRef));
+        }
+    };
+
+    spectrumCanvas.AddHandler(
+        UIElement::PointerPressedEvent(),
+        winrt::box_value(wux::Input::PointerEventHandler(
+            [spectrumCanvas, sRef, vRef, positionCrosshair, emit](
+                auto&&, wux::Input::PointerRoutedEventArgs const& e) {
+                try {
+                    auto pt = e.GetCurrentPoint(spectrumCanvas);
+                    *sRef = std::clamp(pt.Position().X / kSpectrum, 0.0, 1.0);
+                    *vRef = std::clamp(1.0 - pt.Position().Y / kSpectrum, 0.0, 1.0);
+                    positionCrosshair();
+                    emit();
+                    spectrumCanvas.CapturePointer(e.Pointer());
+                    e.Handled(true);
+                } catch (...) {}
+            })),
+        true);
+
+    spectrumCanvas.AddHandler(
+        UIElement::PointerMovedEvent(),
+        winrt::box_value(wux::Input::PointerEventHandler(
+            [spectrumCanvas, sRef, vRef, positionCrosshair, emit](
+                auto&&, wux::Input::PointerRoutedEventArgs const& e) {
+                try {
+                    auto pt = e.GetCurrentPoint(spectrumCanvas);
+                    if (!pt.Properties().IsLeftButtonPressed()) return;
+                    *sRef = std::clamp(pt.Position().X / kSpectrum, 0.0, 1.0);
+                    *vRef = std::clamp(1.0 - pt.Position().Y / kSpectrum, 0.0, 1.0);
+                    positionCrosshair();
+                    emit();
+                    e.Handled(true);
+                } catch (...) {}
+            })),
+        true);
+
+    spectrumCanvas.AddHandler(
+        UIElement::PointerReleasedEvent(),
+        winrt::box_value(wux::Input::PointerEventHandler(
+            [spectrumCanvas](auto&&, wux::Input::PointerRoutedEventArgs const& e) {
+                try { spectrumCanvas.ReleasePointerCapture(e.Pointer()); } catch (...) {}
+            })),
+        true);
+
+    hueCanvas.AddHandler(
+        UIElement::PointerPressedEvent(),
+        winrt::box_value(wux::Input::PointerEventHandler(
+            [hueCanvas, hRef, hueLayer, positionHueMarker, emit, hsvToRgb](
+                auto&&, wux::Input::PointerRoutedEventArgs const& e) {
+                try {
+                    auto pt = e.GetCurrentPoint(hueCanvas);
+                    *hRef = std::clamp(pt.Position().Y / kSpectrum, 0.0, 1.0) * 360.0;
+                    hueLayer.Fill(wuxm::SolidColorBrush(hsvToRgb(*hRef, 1.0, 1.0)));
+                    positionHueMarker();
+                    emit();
+                    hueCanvas.CapturePointer(e.Pointer());
+                    e.Handled(true);
+                } catch (...) {}
+            })),
+        true);
+
+    hueCanvas.AddHandler(
+        UIElement::PointerMovedEvent(),
+        winrt::box_value(wux::Input::PointerEventHandler(
+            [hueCanvas, hRef, hueLayer, positionHueMarker, emit, hsvToRgb](
+                auto&&, wux::Input::PointerRoutedEventArgs const& e) {
+                try {
+                    auto pt = e.GetCurrentPoint(hueCanvas);
+                    if (!pt.Properties().IsLeftButtonPressed()) return;
+                    *hRef = std::clamp(pt.Position().Y / kSpectrum, 0.0, 1.0) * 360.0;
+                    hueLayer.Fill(wuxm::SolidColorBrush(hsvToRgb(*hRef, 1.0, 1.0)));
+                    positionHueMarker();
+                    emit();
+                    e.Handled(true);
+                } catch (...) {}
+            })),
+        true);
+
+    hueCanvas.AddHandler(
+        UIElement::PointerReleasedEvent(),
+        winrt::box_value(wux::Input::PointerEventHandler(
+            [hueCanvas](auto&&, wux::Input::PointerRoutedEventArgs const& e) {
+                try { hueCanvas.ReleasePointerCapture(e.Pointer()); } catch (...) {}
+            })),
+        true);
+
+    wuxc::Border wrapper;
+    wrapper.CornerRadius(CornerRadius{12, 12, 12, 12});
+    wrapper.Padding(Thickness{10, 10, 10, 10});
+    wrapper.Background(MakeSolid(0xFF, 0x1B, 0x1B, 0x1B));
+    wrapper.Child(layout);
+
+    CompactColorPicker result;
+    result.Root = wrapper;
+    result.GetColor = [hRef, sRef, vRef, hsvToRgb]() {
+        return hsvToRgb(*hRef, *sRef, *vRef);
+    };
+    result.SetColor = [hRef, sRef, vRef, hueLayer, positionCrosshair,
+                       positionHueMarker, hsvToRgb, rgbToHsv](wui::Color c) {
+        double hh, ss, vv;
+        rgbToHsv(c, hh, ss, vv);
+        *hRef = hh;
+        *sRef = ss;
+        *vRef = vv;
+        hueLayer.Fill(wuxm::SolidColorBrush(hsvToRgb(hh, 1.0, 1.0)));
+        positionCrosshair();
+        positionHueMarker();
+    };
+    return result;
+}
+
 void AddColorRow(wuxc::StackPanel& panel, const std::wstring& label, PCWSTR key,
                  const std::wstring& desc = L"") {
     std::wstring currentText = GetStringSettingCopy(key);
@@ -11107,76 +11666,19 @@ void AddColorRow(wuxc::StackPanel& panel, const std::wstring& label, PCWSTR key,
         RequestColorReload();
     };
 
-    // --- Compact dark ColorPicker ----------------------------------------
-    // Wheel only (no RGB channel inputs, no built-in value slider — we add
-    // our own lightness slider below, which handles both directions).
-    wuxc::ColorPicker picker;
-    picker.IsAlphaEnabled(false);
-    picker.IsAlphaSliderVisible(false);
-    picker.IsAlphaTextInputVisible(false);
-    // The picker's main square is Hue × Saturation — it can only go toward
-    // white. Darkness is a SEPARATE Value slider; keep it visible or black
-    // is unreachable.
-    picker.IsColorSliderVisible(true);
-    picker.IsColorChannelTextInputVisible(false);
-    picker.IsHexInputVisible(true);
-    picker.IsMoreButtonVisible(false);
-    picker.RequestedTheme(wux::ElementTheme::Dark);
-    picker.Width(280);
-    picker.Color(current);
+    CompactColorPicker picker = BuildCompactColorPicker(current,
+        [curColor, commitColor](wui::Color c) {
+            if (c == *curColor) return;
+            commitColor(c);
+        });
 
-    // Recursively release every pointer capture held anywhere in a subtree.
-    // Called when the picker's internal slider got a PointerPressed but its
-    // PointerReleased was delivered to the wrong HWND (cursor released
-    // outside the popup) — without this the slider keeps tracking the
-    // cursor forever.
-    auto releaseCapturesRecursive = std::make_shared<std::function<void(wux::UIElement const&)>>();
-    *releaseCapturesRecursive = [releaseCapturesRecursive](wux::UIElement const& node) {
-        if (!node) return;
-        try { node.ReleasePointerCaptures(); } catch (...) {}
-        try {
-            int n = wuxm::VisualTreeHelper::GetChildrenCount(node);
-            for (int i = 0; i < n; i++) {
-                if (auto child = wuxm::VisualTreeHelper::GetChild(node, i).try_as<wux::UIElement>()) {
-                    (*releaseCapturesRecursive)(child);
-                }
-            }
-        } catch (...) {}
-    };
-
-    // Picker → commit. Value comparison, not a guard flag, so a single stray
-    // event doesn't drop a real update.
-    picker.ColorChanged([picker, curColor, commitColor, releaseCapturesRecursive](auto&&, auto&&) {
-        wui::Color c = picker.Color();
-        if (c == *curColor) return;
-        commitColor(c);
-        // If the physical button is no longer held, no capture should be
-        // outstanding. Release any that survived a release-outside-the-popup.
-        if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
-            (*releaseCapturesRecursive)(picker);
-        }
-    });
-
-    // Same cleanup on any pointer movement over the picker — fires even when
-    // the child slider is not receiving events because its capture is stuck.
-    picker.PointerMoved([picker, releaseCapturesRecursive](
-        auto&&, wux::Input::PointerRoutedEventArgs const& e) {
-        try {
-            auto pp = e.GetCurrentPoint(picker);
-            if (!pp.Properties().IsLeftButtonPressed()) {
-                (*releaseCapturesRecursive)(picker);
-            }
-        } catch (...) {}
-    });
-
-    // Textbox → picker + commit.
     auto commitHex = [picker, curColor, commitColor](const std::wstring& v) {
         wui::Color c{ 255, 0, 0, 0 };
         if (!TryParseHexColor(v, &c)) {
             if (!TryParseNamedColor(v, &c)) return;
         }
         if (c == *curColor) return;
-        if (picker.Color() != c) picker.Color(c);
+        if (picker.GetColor() != c) picker.SetColor(c);
         commitColor(c);
     };
     tb.LostFocus([commitHex](auto&& sender, auto&&) {
@@ -11191,16 +11693,14 @@ void AddColorRow(wuxc::StackPanel& panel, const std::wstring& label, PCWSTR key,
     wuxc::StackPanel pickerColumn;
     pickerColumn.Orientation(wuxc::Orientation::Vertical);
     pickerColumn.Spacing(6);
-    pickerColumn.Children().Append(picker);
+    pickerColumn.Children().Append(picker.Root);
 
     wuxc::Border wrap;
-    wrap.Background(MakeSolid(0xFF, 0x1F, 0x1F, 0x1F));
-    wrap.BorderBrush(MakeSolid(0xFF, 0x40, 0x40, 0x40));
-    wrap.BorderThickness(Thickness{ 1, 1, 1, 1 });
-    wrap.CornerRadius(CornerRadius{ 8, 8, 8, 8 });
-    wrap.Padding(Thickness{ 10, 10, 10, 10 });
-    wrap.RequestedTheme(wux::ElementTheme::Dark);
+    wrap.CornerRadius(CornerRadius{ 12, 12, 12, 12 });
+    wrap.Padding(Thickness{ 0, 0, 0, 0 });
+    wrap.Margin(Thickness{ 0, 6, 0, 0 });
     wrap.Child(pickerColumn);
+    wrap.Visibility(Visibility::Collapsed);
 
     wuxc::Flyout flyout;
     flyout.Content(wrap);
@@ -11223,11 +11723,11 @@ void AddColorRow(wuxc::StackPanel& panel, const std::wstring& label, PCWSTR key,
     auto pickerDragging = std::make_shared<bool>(false);
     auto markDown = [pickerDragging](auto&&, auto&&) { *pickerDragging = true;  };
     auto markUp   = [pickerDragging](auto&&, auto&&) { *pickerDragging = false; };
-    picker.AddHandler(wux::UIElement::PointerPressedEvent(),
+    picker.Root.AddHandler(wux::UIElement::PointerPressedEvent(),
         winrt::box_value(wux::Input::PointerEventHandler(markDown)), true);
-    picker.AddHandler(wux::UIElement::PointerReleasedEvent(),
+    picker.Root.AddHandler(wux::UIElement::PointerReleasedEvent(),
         winrt::box_value(wux::Input::PointerEventHandler(markUp)), true);
-    picker.AddHandler(wux::UIElement::PointerCaptureLostEvent(),
+    picker.Root.AddHandler(wux::UIElement::PointerCaptureLostEvent(),
         winrt::box_value(wux::Input::PointerEventHandler(markUp)), true);
 
     flyout.Opened([](auto&&, auto&&) {
@@ -11249,7 +11749,16 @@ void AddColorRow(wuxc::StackPanel& panel, const std::wstring& label, PCWSTR key,
             ScheduleReload();
         }
     });
-    swatch.Flyout(flyout);
+    wrap.Visibility(Visibility::Collapsed);
+    wrap.Margin(Thickness{ 0, 8, 0, 0 });
+
+    swatch.Click([wrap](wf::IInspectable const&, RoutedEventArgs const&) {
+        try {
+            wrap.Visibility(wrap.Visibility() == Visibility::Visible
+                                ? Visibility::Collapsed
+                                : Visibility::Visible);
+        } catch (...) {}
+    });
 
     // [■ swatch]  [ hex textbox ]
     wuxc::StackPanel inline_;
@@ -11259,8 +11768,13 @@ void AddColorRow(wuxc::StackPanel& panel, const std::wstring& label, PCWSTR key,
     inline_.Children().Append(swatch);
     inline_.Children().Append(tb);
 
+    wuxc::StackPanel rowContainer;
+    rowContainer.Spacing(0);
+    rowContainer.Children().Append(MakeRowShell(label, inline_, desc));
+    rowContainer.Children().Append(wrap);
+
     auto card = MakeCard();
-    card.Child(MakeRowShell(label, inline_, desc));
+    card.Child(rowContainer);
     panel.Children().Append(card);
 }
 
@@ -11526,6 +12040,8 @@ void BuildAppearancePage(wuxc::StackPanel& p) {
         { L"Verdana",           L"Verdana" },
     }, L"Applies to every label and icon in the topbar.");
     AddBoolRow(p, L"Bold text", L"fontBold");
+    AddColorRow(p, L"Font color", L"fontColor",
+                L"Foreground color for every label in the topbar and flyouts.");
 
     p.Children().Append(MakeHeading(L"Clock & Date"));
     AddTextRow(p, L"Time format", L"timeFormat",
@@ -11597,6 +12113,7 @@ static std::wstring BuildSettingsJson() {
     addStr(L"topBarBackgroundColor");
     addInt(L"topBarBackgroundOpacity");
     addStr(L"iconColor");
+    addStr(L"fontColor");
     addStr(L"fontFamily");
     addInt(L"fontBold");
     addStr(L"timeFormat");
@@ -11629,7 +12146,7 @@ static std::wstring BuildSettingsJson() {
 
 void BuildAboutPage(wuxc::StackPanel& p) {
     p.Children().Append(MakeHeading(L"TopBar for Windows", 22));
-    p.Children().Append(MakeLabel(L"Version 1.2.0", 13, false, 0.65));
+    p.Children().Append(MakeLabel(L"Version 1.3.0", 13, false, 0.65));
     auto info = MakeLabel(
         L"Mod Created By WasiXGamer. Settings App inspired by Taskbar Fluent Media Player mod by Slayts, Windhawk Blur imported from Windows 11 Taskbar Styler by m417z.",
         12, false, 0.8);
@@ -12216,7 +12733,7 @@ wuxc::Grid BuildWindowContent() {
                     MB_YESNO | MB_ICONWARNING) != IDYES) return;
             const wchar_t* keys[] = {
                 L"barHeight", L"cornerRadius", L"topBarBackgroundColor",
-                L"topBarBackgroundOpacity", L"iconColor", L"fontFamily", L"fontBold",
+                L"topBarBackgroundOpacity", L"iconColor", L"fontColor", L"fontFamily", L"fontBold",
                 L"timeFormat", L"dateFormat", L"showClock", L"showDate",
                 L"leftItems", L"centerItems", L"rightItems",
                 L"taskButtonWidth", L"taskIconSize", L"taskButtonContent",
@@ -12325,7 +12842,7 @@ wuxc::Grid BuildWindowContent() {
             row.VerticalAlignment(VerticalAlignment::Center);
             row.HorizontalAlignment(HorizontalAlignment::Center);
 
-            if (auto icon = BuildVectorIcon(nullptr, fillPath, L"", 24, 16, 1.5)) {
+            if (auto icon = BuildVectorIcon(nullptr, fillPath, L"", 24, 16, 1.5, L"#FFFFFF")) {
                 icon.VerticalAlignment(VerticalAlignment::Center);
                 row.Children().Append(icon);
             }
@@ -12649,8 +13166,18 @@ FrameworkElement BuildTopBarContent() {
     // instead.
     root.DoubleTapped([](auto&&, Input::DoubleTappedRoutedEventArgs const& args) {
         args.Handled(true);
-        if (g_lastForegroundHwnd && IsWindow(g_lastForegroundHwnd)) {
-            ToggleMaximizeWindow(g_lastForegroundHwnd);
+        HWND target = g_lastForegroundHwnd;
+        if (target && IsWindow(target)) {
+            // Defer to a background thread. ToggleMaximizeWindow uses
+            // AttachThreadInput to force the target to foreground, which
+            // briefly synchronizes our thread's input queue with the
+            // target's. Doing that on the UI thread makes the mouse cursor
+            // stutter: WM_MOUSEMOVE messages queue up during the attach
+            // and flush all at once when it releases. A background thread
+            // has no UI input queue, so the attach costs nothing visible.
+            RunInBackground([target] {
+                try { ToggleMaximizeWindow(target); } catch (...) {}
+            });
         }
     });
 
@@ -12687,7 +13214,7 @@ FrameworkElement BuildTopBarContent() {
         StyleMenuFlyout(menu);
         menu.Items().Append(MakeMenuItem(L"TopBar settings…", [] {
             OpenTopBarSettingsWindow();
-        }));
+        }, L"\uE713"));
         menu.Items().Append(MakeMenuItem(L"Reload TopBar", [] {
             RunOnUiThread([] {
                 if (!g_topBarHwnd) return;
@@ -12704,7 +13231,10 @@ FrameworkElement BuildTopBarContent() {
                 PositionAppBar(g_topBarHwnd, g_barHeightPx);
                 RefreshTaskList(true);
             });
-        }));
+        }, L"\uE895"));
+        menu.Items().Append(MakeMenuItem(L"Restart Explorer", [] {
+            RestartExplorerShell();
+        }, L"\uE72C"));
         auto fe = sender.as<FrameworkElement>();
         auto pt = args.GetPosition(fe);
         menu.ShowAt(fe, pt);   // anchor at the cursor, not the element's corner
@@ -13032,9 +13562,11 @@ g_centerPanel.Children().Append(resourceButton);
         clockButton.Padding(Thickness{10, 0, 10, 0});
         clockButton.HorizontalContentAlignment(HorizontalAlignment::Center);
 
-        auto clockText = MakeText(L"ClockText", FormatClockText(), 14);
+        auto clockText = MakeText(L"ClockText", L"", 14);
         clockText.TextAlignment(TextAlignment::Center);
         clockText.LineHeight(15);
+        clockText.IsColorFontEnabled(false);
+        ApplyClockInlines(clockText, FormatClockText());
         clockButton.Content(clockText);
         clockButton.Click([](auto&&, auto&&) {
             RunShellCommand(L"ms-actioncenter:");
@@ -13122,9 +13654,7 @@ g_centerPanel.Children().Append(resourceButton);
 
     // ---- Recycle bin button ----------------------------------------------
     {
-        auto binIcon = BuildVectorIcon(L"RecycleBinIcon",
-                                       icons::kRecycleBinBody,
-                                       icons::kRecycleBinLid, 24, 18, 1.6);
+        auto binIcon = BuildRecycleBinIcon(18);
         auto binButton = MakeControlButton(
             L"RecycleBinButton", binIcon, wuxc::Flyout{nullptr},
             nullptr);
@@ -13234,6 +13764,32 @@ g_centerPanel.Children().Append(resourceButton);
     RegisterNamed(L"ControlCenterPanel", rightPanel);
     RegisterNamed(L"TrayPanel", rightPanel);
     RegisterNamed(L"TopBarRoot", root);
+
+    // Prevent the topbar's own buttons from showing focus visuals. XAML
+    // auto-focuses the first focusable element when the bar popup opens,
+    // which paints a white outline on the Start button; and every time a
+    // child flyout closes, XAML restores focus to whichever button opened
+    // it, which repaints the same outline. Taking these buttons out of
+    // tab navigation stops both. Flyout content is unaffected: it is
+    // created separately and keeps its own IsTabStop.
+    for (auto const& name : { L"StartButton", L"SearchButton",
+                              L"DisplayButton", L"SoundButton", L"WifiButton",
+                              L"BluetoothButton", L"BatteryButton",
+                              L"ResourceButton", L"WeatherButton",
+                              L"RecycleBinButton", L"SettingsButton",
+                              L"ClockButton" }) {
+        auto it = g_namedElements.find(name);
+        if (it == g_namedElements.end()) continue;
+        if (auto btn = it->second.try_as<wuxc::Button>()) {
+            try { btn.IsTabStop(false); } catch (...) {}
+        }
+    }
+    // Task buttons are dynamically created per window and stored in a map
+    // rather than g_namedElements; disable tab-stop on them too so they
+    // don't inherit the same focus outline.
+    for (auto& entry : g_taskButtonsByHwnd) {
+        try { entry.second.IsTabStop(false); } catch (...) {}
+    }
 
     g_rootElement = barRoot;   // Outer root includes wallpaper
     return barRoot;
@@ -14074,7 +14630,7 @@ void UpdateClockText() {
         return;
     }
     if (auto text = it->second.try_as<wuxc::TextBlock>()) {
-        text.Text(winrt::hstring(FormatClockText()));
+        ApplyClockInlines(text, FormatClockText());
     }
 }
 
@@ -14981,9 +15537,15 @@ void LoadSettings() {
     g_settings.leftItems = GetStringSettingCopy(L"leftItems");
     g_settings.centerItems = GetStringSettingCopy(L"centerItems");
     g_settings.rightItems = GetStringSettingCopy(L"rightItems");
-    if (g_settings.leftItems.empty()) g_settings.leftItems = L"StartButton,SearchButton";
-    if (g_settings.centerItems.empty()) g_settings.centerItems = L"ResourceButton,WeatherButton,SettingsButton";
-    if (g_settings.rightItems.empty()) g_settings.rightItems = L"DisplayButton,SoundButton,WifiButton,BluetoothButton,BatteryButton,RecycleBinButton,ClockButton";
+    if (g_settings.leftItems.empty() && g_settings.centerItems.empty() &&
+        g_settings.rightItems.empty()) {
+        g_settings.leftItems = L"StartButton,SearchButton";
+        g_settings.centerItems = L"ResourceButton,WeatherButton,SettingsButton";
+        g_settings.rightItems = L"DisplayButton,SoundButton,WifiButton,BluetoothButton,BatteryButton,RecycleBinButton,ClockButton";
+        Wh_SetStringValue(L"leftItems", g_settings.leftItems.c_str());
+        Wh_SetStringValue(L"centerItems", g_settings.centerItems.c_str());
+        Wh_SetStringValue(L"rightItems", g_settings.rightItems.c_str());
+    }
 
     g_settings.showCpuUsage = ReadIntSetting(L"showCpuUsage", 1) != 0;
     g_settings.showRamUsage = ReadIntSetting(L"showRamUsage", 1) != 0;
@@ -15002,6 +15564,10 @@ void LoadSettings() {
     g_settings.iconColor = GetStringSettingCopy(L"iconColor");
     if (g_settings.iconColor.empty()) {
         g_settings.iconColor = L"#FFFFFF";
+    }
+    g_settings.fontColor = GetStringSettingCopy(L"fontColor");
+    if (g_settings.fontColor.empty()) {
+        g_settings.fontColor = L"#FFFFFF";
     }
     g_iconColorOverride.reset();
     g_settings.fontFamily = GetStringSettingCopy(L"fontFamily");
