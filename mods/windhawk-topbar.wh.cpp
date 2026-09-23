@@ -1264,6 +1264,7 @@ static HWND g_subclassedPopupHwnd = nullptr;
 static WNDPROC g_prevPopupProc = nullptr;
 static std::atomic<bool> g_anyChildFlyoutOpen{false};
 static HHOOK g_childFlyoutMouseHook = nullptr;
+static bool g_forcePopupPosition = false;
 static bool g_forceShowAt = false;
 static int  g_replaceAttempts = 0;
 
@@ -13463,6 +13464,22 @@ void InstallChildFlyoutMouseHook() {
 }
 
 LRESULT CALLBACK TopBarPopupSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_WINDOWPOSCHANGING && g_forcePopupPosition) {
+        // When XAML has repeatedly refused to place the popup at the
+        // reserved slot (cold-boot compositor race), override its
+        // placement here. Every SetWindowPos XAML issues is rewritten to
+        // the reserved strip before Windows commits it, so the popup
+        // stays put and no tug-of-war occurs.
+        auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        RECT mr = GetBarMonitorRect();
+        wp->x = mr.left;
+        wp->y = mr.top;
+        wp->cx = mr.right - mr.left;
+        wp->cy = g_barHeightPx;
+        wp->flags &= ~SWP_HIDEWINDOW;
+        wp->flags |= SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOZORDER;
+        return 0;
+    }
     if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
         if (g_anyChildFlyoutOpen.load()) {
             // A click on the topbar popup while a child flyout is open. The
@@ -13551,62 +13568,132 @@ void RepositionTopBarPopup() {
 void EnsureTopBarPopupShown() {
     if (!g_topBarPopup || !g_topBarPopupAnchor) return;
 
-    if (!g_topBarPopupHwnd || !IsWindow(g_topBarPopupHwnd)) {
-        g_topBarPopupHwnd = FindTopBarFlyoutHwnd();
+    // Only proceed once the topbar HWND is visible and the island HWND
+    // has been sized. On cold boot XAML's compositor can lag several
+    // hundred milliseconds behind process start; ShowAt before that
+    // produces a popup that either renders wrong or doesn't render at all.
+    bool windowReady = false;
+    if (g_topBarHwnd && IsWindowVisible(g_topBarHwnd)) {
+        if (g_islandHwnd && IsWindow(g_islandHwnd)) {
+            RECT r{};
+            if (GetWindowRect(g_islandHwnd, &r) &&
+                r.right > r.left && r.bottom > r.top) {
+                windowReady = true;
+            }
+        }
     }
 
-    if (!g_topBarPopupHwnd) {
-        // Wait until the popup canvas is connected to a XAML tree before
-        // calling ShowAt. Before that, XAML has no meaningful anchor
-        // transform and the placement resolves to whatever overflow
-        // handling decides, which produces the "sometimes top, sometimes
-        // bottom" pattern.
-        bool treeReady = false;
-        try {
-            treeReady = (g_topBarPopupCanvas &&
-                         g_topBarPopupCanvas.XamlRoot() != nullptr);
-        } catch (...) {}
+    // Drop a stale cached HWND if the popup has been destroyed.
+    if (g_topBarPopupHwnd && !IsWindow(g_topBarPopupHwnd)) {
+        g_topBarPopupHwnd = nullptr;
+    }
 
-        if (treeReady) {
-            // Force the whole tree to complete a layout pass. Without this
-            // the anchor's reported position can lag by one pass, which
-            // places the flyout one bar-height too low.
-            try { if (g_rootElement) g_rootElement.UpdateLayout(); } catch (...) {}
-            try { g_topBarPopupCanvas.UpdateLayout(); } catch (...) {}
-
-            try {
-                wuxc::Primitives::FlyoutShowOptions opts;
-                // TopEdgeAlignedLeft places the flyout's top-left exactly
-                // at the anchor point. With the anchor at island (0, 0),
-                // that is screen (0, 0) — the top-left of the reserved
-                // strip. No offset compensation needed.
-                opts.Position(wf::Point{0, 0});
-                opts.Placement(wuxc::Primitives::FlyoutPlacementMode::TopEdgeAlignedLeft);
-                g_topBarPopup.ShowAt(g_topBarPopupAnchor, opts);
-
-                // One-shot diagnostic per process. Prints exactly where
-                // the popup landed so any residual offset is visible.
-                static bool s_loggedOnce = false;
-                if (!s_loggedOnce) {
-                    s_loggedOnce = true;
-                    if (HWND h = FindTopBarFlyoutHwnd()) {
-                        RECT r{}; GetWindowRect(h, &r);
-                        RECT mr = GetBarMonitorRect();
-                        Wh_Log(L"TopBar place: flyoutTL=(%ld,%ld) size=(%ld,%ld) monitorTL=(%ld,%ld) barPx=%d dpi=%.2f",
-                               r.left, r.top,
-                               r.right - r.left, r.bottom - r.top,
-                               mr.left, mr.top,
-                               g_barHeightPx, g_dpiScale);
-                    }
-                }
-            } catch (...) {}
+    // Evaluate the current popup state.
+    RECT mr = GetBarMonitorRect();
+    bool havePopup = (g_topBarPopupHwnd != nullptr);
+    bool correct = false;
+    if (havePopup) {
+        RECT actual{};
+        if (GetWindowRect(g_topBarPopupHwnd, &actual)) {
+            correct = (actual.left == mr.left && actual.top == mr.top);
         }
-    } else {
+    }
+
+    if (correct) {
+        // Popup is up and in the right place. Just re-assert topmost and
+        // promote any open child flyout above it.
         SetWindowPos(g_topBarPopupHwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (g_anyChildFlyoutOpen.load()) {
             PromoteChildFlyoutPopups();
         }
+        g_replaceAttempts = 0;
+        g_forcePopupPosition = false;
+    } else if (windowReady) {
+        // Popup missing, or it's at the wrong position. Tear it down if it
+        // exists and try to show it fresh against the current XAML tree.
+        if (havePopup) {
+            try {
+                g_topBarAllowClose = true;
+                g_topBarPopup.Hide();
+                g_topBarAllowClose = false;
+            } catch (...) { g_topBarAllowClose = false; }
+            g_topBarPopupHwnd = nullptr;
+        }
+
+        // The anchor must be genuinely in the visual tree, not just have
+        // a XamlRoot.
+        bool anchorReady = false;
+        try {
+            if (g_topBarPopupCanvas && g_topBarPopupCanvas.XamlRoot()) {
+                auto parent = wuxm::VisualTreeHelper::GetParent(g_topBarPopupAnchor);
+                anchorReady = (parent != nullptr);
+            }
+        } catch (...) {}
+
+        if (anchorReady) {
+            // Force layout so the anchor's position is committed before
+            // placement reads it.
+            try { if (g_rootElement) g_rootElement.UpdateLayout(); } catch (...) {}
+            try { g_topBarPopupCanvas.UpdateLayout(); } catch (...) {}
+
+            try {
+                wuxc::Primitives::FlyoutShowOptions opts;
+                opts.Position(wf::Point{0, 0});
+                opts.Placement(wuxc::Primitives::FlyoutPlacementMode::TopEdgeAlignedLeft);
+                g_topBarPopup.ShowAt(g_topBarPopupAnchor, opts);
+            } catch (winrt::hresult_error const& ex) {
+                static bool s_loggedShowAtErr = false;
+                if (!s_loggedShowAtErr) {
+                    s_loggedShowAtErr = true;
+                    Wh_Log(L"TopBar ShowAt failed: 0x%08X %s",
+                           static_cast<unsigned>(ex.code().value),
+                           ex.message().c_str());
+                }
+            } catch (...) {}
+
+            if (!g_topBarPopupHwnd || !IsWindow(g_topBarPopupHwnd)) {
+                g_topBarPopupHwnd = FindTopBarFlyoutHwnd();
+            }
+
+            // Verify the popup actually landed at the reserved slot. If
+            // not, count the failure and eventually force the position.
+            if (g_topBarPopupHwnd) {
+                RECT actual{};
+                if (GetWindowRect(g_topBarPopupHwnd, &actual)) {
+                    if (actual.left == mr.left && actual.top == mr.top) {
+                        g_replaceAttempts = 0;
+                    } else {
+                        g_replaceAttempts++;
+                        static bool s_loggedWrongPos = false;
+                        if (!s_loggedWrongPos) {
+                            s_loggedWrongPos = true;
+                            Wh_Log(L"TopBar: popup at (%ld,%ld), wanted (%ld,%ld), attempt %d",
+                                   actual.left, actual.top,
+                                   mr.left, mr.top,
+                                   g_replaceAttempts);
+                        }
+                        constexpr int kMaxXamlAttempts = 3;
+                        if (g_replaceAttempts > kMaxXamlAttempts &&
+                            !g_forcePopupPosition) {
+                            g_forcePopupPosition = true;
+                            Wh_Log(L"TopBar: forcing popup position after repeated XAML failures");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // else: not ready yet, wait for the next tick.
+
+    // If XAML has repeatedly mis-placed the popup, take over positioning
+    // directly. The subclass proc blocks XAML's own SetWindowPos calls
+    // whenever g_forcePopupPosition is set, so this is stable.
+    if (g_forcePopupPosition && g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+        SetWindowPos(g_topBarPopupHwnd, HWND_TOPMOST,
+                     mr.left, mr.top,
+                     mr.right - mr.left, g_barHeightPx,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
     ClipIslandHwndToEmpty();
