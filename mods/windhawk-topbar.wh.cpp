@@ -1245,7 +1245,6 @@ HMODULE g_modModule = nullptr;
 
 HWND g_topBarHwnd;
 HWND g_islandHwnd;
-[[clang::no_destroy]] wuxc::Grid g_wallpaperLayer{nullptr};  // Store the wallpaper layer for updates
 
 int g_barHeightPx = 40;
 double g_dpiScale = 1.0;
@@ -1265,6 +1264,8 @@ static HWND g_subclassedPopupHwnd = nullptr;
 static WNDPROC g_prevPopupProc = nullptr;
 static std::atomic<bool> g_anyChildFlyoutOpen{false};
 static HHOOK g_childFlyoutMouseHook = nullptr;
+static bool g_forceShowAt = false;
+static int  g_replaceAttempts = 0;
 
 // Every open flyout / context menu is registered here so that
 // CloseAnyOpenChildFlyout can dismiss all of them, and so the topbar's
@@ -10230,58 +10231,7 @@ void RegisterNamed(PCWSTR name, FrameworkElement const& element) {
         g_namedElements.insert_or_assign(name, element);
     }
 }
-// Gets the current desktop wallpaper and returns an ImageBrush from it.
-// Returns an empty brush if wallpaper is missing or fails to load.
-wuxm::ImageBrush GetWallpaperBrush() {
-    wuxm::ImageBrush brush;
 
-    wchar_t wallpaperPath[MAX_PATH] = {0};
-    if (SystemParametersInfo(SPI_GETDESKWALLPAPER, MAX_PATH, wallpaperPath, 0) && wallpaperPath[0]) {
-        std::wstring uriPath = wallpaperPath;
-        std::replace(uriPath.begin(), uriPath.end(), L'\\', L'/');
-        // Cache-busting query so WinRT re-decodes when the file content changes
-        // at the same path (e.g. TranscodedWallpaper).
-        wchar_t suffix[32];
-        swprintf_s(suffix, L"?v=%llu", static_cast<unsigned long long>(GetTickCount64()));
-        uriPath = L"file:///" + uriPath + suffix;
-
-        try {
-            wuxm::Imaging::BitmapImage bitmap;
-            bitmap.UriSource(wf::Uri(winrt::hstring(uriPath)));
-            brush.ImageSource(bitmap);
-            brush.Stretch(wuxm::Stretch::UniformToFill);
-            brush.AlignmentX(wuxm::AlignmentX::Left);
-            brush.AlignmentY(wuxm::AlignmentY::Top);
-        } catch (...) {
-        }
-    }
-    return brush;
-}
-
-// Checks if the wallpaper has changed and updates the background
-void UpdateWallpaperIfChanged() {
-    if (!g_wallpaperLayer) return;
-
-    wchar_t wallpaperPath[MAX_PATH] = {0};
-    if (!SystemParametersInfo(SPI_GETDESKWALLPAPER, MAX_PATH, wallpaperPath, 0) || !wallpaperPath[0]) {
-        return;
-    }
-    std::wstring currentPath = wallpaperPath;
-    unsigned long long stamp = 0;
-    WIN32_FILE_ATTRIBUTE_DATA fad{};
-    if (GetFileAttributesExW(currentPath.c_str(), GetFileExInfoStandard, &fad)) {
-        stamp = (static_cast<unsigned long long>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
-                fad.ftLastWriteTime.dwLowDateTime;
-    }
-    static std::wstring s_lastPath;
-    static unsigned long long s_lastStamp = 0;
-    if (currentPath != s_lastPath || stamp != s_lastStamp) {
-        s_lastPath = currentPath;
-        s_lastStamp = stamp;
-        g_wallpaperLayer.Background(GetWallpaperBrush());
-        Wh_Log(L"TopBar: Wallpaper updated: %s", currentPath.c_str());
-    }
-}
 // Wheel over the Display and Sound buttons adjusts brightness and volume in
 // place. Both read through the cached fast path so a fast scroll doesn't queue
 // up a WMI query or a device activation per notch.
@@ -12648,25 +12598,13 @@ FrameworkElement BuildTopBarContent() {
     g_lastAppTitleTarget = nullptr;
     g_lastAppTitleText.clear();
 
-    // Outer root grid that holds everything (background + interactive bar)
+    // Outer root grid that holds the interactive bar. Kept so existing
+    // styles that target Grid#BarRoot > Grid#TopBarRoot still resolve.
     wuxc::Grid barRoot;
     barRoot.Name(L"BarRoot");
     barRoot.HorizontalAlignment(HorizontalAlignment::Stretch);
     barRoot.VerticalAlignment(VerticalAlignment::Stretch);
     barRoot.Background(nullptr); // Transparent so the blur shows through
-    // Wallpaper layer (added first so it's behind everything)
-    wuxm::ImageBrush wallpaperBrush = GetWallpaperBrush();
-    {
-        wuxc::Grid wallpaperLayer;
-        wallpaperLayer.Name(L"WallpaperLayer");
-        wallpaperLayer.Background(wallpaperBrush);
-        wallpaperLayer.IsHitTestVisible(false); // don't block clicks
-        wallpaperLayer.HorizontalAlignment(HorizontalAlignment::Stretch);
-        wallpaperLayer.VerticalAlignment(VerticalAlignment::Stretch);
-        wallpaperLayer.Opacity(1.0);
-        barRoot.Children().Append(wallpaperLayer);
-        g_wallpaperLayer = wallpaperLayer; // Save reference
-    }
     // Interactive content grid (This is TopBarRoot and gets the blur)
     wuxc::Grid root;
     root.Name(L"TopBarRoot");
@@ -13613,39 +13551,57 @@ void RepositionTopBarPopup() {
 void EnsureTopBarPopupShown() {
     if (!g_topBarPopup || !g_topBarPopupAnchor) return;
 
-    // Refind the HWND only if we don't have a live cached one. Caching matters
-    // because there may be several Xaml popup HWNDs in the process (control
-    // flyouts, context menus, the Ctrl+D target picker) — once we've claimed
-    // ours, always position that one.
     if (!g_topBarPopupHwnd || !IsWindow(g_topBarPopupHwnd)) {
         g_topBarPopupHwnd = FindTopBarFlyoutHwnd();
     }
 
     if (!g_topBarPopupHwnd) {
-        // No popup HWND yet. The first ShowAt on a not-yet-rendered XAML tree
-        // silently no-ops; call it again on every tick until the HWND appears.
-        // ShowAt on an already-open flyout is a documented no-op.
+        // Wait until the popup canvas is connected to a XAML tree before
+        // calling ShowAt. Before that, XAML has no meaningful anchor
+        // transform and the placement resolves to whatever overflow
+        // handling decides, which produces the "sometimes top, sometimes
+        // bottom" pattern.
+        bool treeReady = false;
         try {
-            wuxc::Primitives::FlyoutShowOptions opts;
-            // XAML's BottomEdgeAlignedLeft on a 0x0 anchor at island (0,0)
-            // lands the flyout at screen (0, barHeight) instead of (0, 0).
-            // XAML caches that position and uses it for hit-testing and for
-            // anchoring child flyouts, which is why the buttons appeared
-            // unclickable and child flyouts opened one bar-height too low.
-            // Pre-offsetting Position by -barHeightDip makes XAML's own
-            // placement math land the flyout at (0, 0), so its cache
-            // finally agrees with where we put the window.
-            opts.Position(wf::Point{0, -static_cast<float>(g_settings.barHeightDip)});
-            opts.Placement(wuxc::Primitives::FlyoutPlacementMode::BottomEdgeAlignedLeft);
-            g_topBarPopup.ShowAt(g_topBarPopupAnchor, opts);
+            treeReady = (g_topBarPopupCanvas &&
+                         g_topBarPopupCanvas.XamlRoot() != nullptr);
         } catch (...) {}
+
+        if (treeReady) {
+            // Force the whole tree to complete a layout pass. Without this
+            // the anchor's reported position can lag by one pass, which
+            // places the flyout one bar-height too low.
+            try { if (g_rootElement) g_rootElement.UpdateLayout(); } catch (...) {}
+            try { g_topBarPopupCanvas.UpdateLayout(); } catch (...) {}
+
+            try {
+                wuxc::Primitives::FlyoutShowOptions opts;
+                // TopEdgeAlignedLeft places the flyout's top-left exactly
+                // at the anchor point. With the anchor at island (0, 0),
+                // that is screen (0, 0) — the top-left of the reserved
+                // strip. No offset compensation needed.
+                opts.Position(wf::Point{0, 0});
+                opts.Placement(wuxc::Primitives::FlyoutPlacementMode::TopEdgeAlignedLeft);
+                g_topBarPopup.ShowAt(g_topBarPopupAnchor, opts);
+
+                // One-shot diagnostic per process. Prints exactly where
+                // the popup landed so any residual offset is visible.
+                static bool s_loggedOnce = false;
+                if (!s_loggedOnce) {
+                    s_loggedOnce = true;
+                    if (HWND h = FindTopBarFlyoutHwnd()) {
+                        RECT r{}; GetWindowRect(h, &r);
+                        RECT mr = GetBarMonitorRect();
+                        Wh_Log(L"TopBar place: flyoutTL=(%ld,%ld) size=(%ld,%ld) monitorTL=(%ld,%ld) barPx=%d dpi=%.2f",
+                               r.left, r.top,
+                               r.right - r.left, r.bottom - r.top,
+                               mr.left, mr.top,
+                               g_barHeightPx, g_dpiScale);
+                    }
+                }
+            } catch (...) {}
+        }
     } else {
-        // Keep the topbar popup topmost, then promote any open child
-        // flyout popups above it. Suppressing the topmost re-assertion
-        // here (the previous approach) let the topbar popup slide above
-        // the child, which made the flyout appear dim. Promoting the
-        // child restores the correct stacking without touching the
-        // topbar's own z-order.
         SetWindowPos(g_topBarPopupHwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (g_anyChildFlyoutOpen.load()) {
@@ -13653,14 +13609,11 @@ void EnsureTopBarPopupShown() {
         }
     }
 
-    // Always clip the island. Every SetWindowPos / popup churn re-shows it.
     ClipIslandHwndToEmpty();
 
-    // Keep the tick alive forever. XAML's async placement pass can move the
-    // flyout at any time; re-asserting every 100 ms wins that race.
     if (!g_topBarPopupRetryTimer) {
         g_topBarPopupRetryTimer = DispatcherTimer();
-        g_topBarPopupRetryTimer.Interval(std::chrono::milliseconds(500));
+        g_topBarPopupRetryTimer.Interval(std::chrono::milliseconds(200));
         g_topBarPopupRetryTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
             try { EnsureTopBarPopupShown(); } catch (...) {}
         });
@@ -13675,6 +13628,12 @@ void SetTopBarContent(FrameworkElement content) {
     double widthDip = (monitorRect.right - monitorRect.left) / dpiScale;
     double heightDip = static_cast<double>(g_settings.barHeightDip);
 
+    // The whole tree is being rebuilt — the current popup HWND and its
+    // position are about to be invalidated, so clear the re-place budget
+    // and let the retry tick place it fresh.
+    g_replaceAttempts = 0;
+    g_forceShowAt = false;
+
     if (!g_topBarPopup) {
         g_topBarPopupCanvas = wuxc::Canvas();
         g_topBarPopupCanvas.HorizontalAlignment(HorizontalAlignment::Stretch);
@@ -13686,12 +13645,13 @@ void SetTopBarContent(FrameworkElement content) {
         g_topBarPopupAnchor.HorizontalAlignment(HorizontalAlignment::Left);
         g_topBarPopupAnchor.VerticalAlignment(VerticalAlignment::Top);
         wuxc::Canvas::SetLeft(g_topBarPopupAnchor, 0);
-        // Move the anchor up by the bar height so XAML's own placement
-        // math lands the parent flyout at screen y=0 instead of y=barHeight.
-        // If XAML then caches the right origin, the child-flyout offset
-        // disappears; the subclass in TopBarPopupSubclassProc can then be
-        // retired.
-        wuxc::Canvas::SetTop(g_topBarPopupAnchor, -heightDip);
+        // Anchor at the island's top-left. TopEdgeAlignedLeft then places
+        // the flyout's top-left exactly at the anchor point, so no offset
+        // compensation is needed. The previous scheme (negative anchor
+        // offset + BottomEdgeAlignedLeft + negative Position) relied on
+        // XAML's overflow handling to flip the placement, which resolved
+        // differently depending on whether the tree was still warming up.
+        wuxc::Canvas::SetTop(g_topBarPopupAnchor, 0);
         g_topBarPopupCanvas.Children().Append(g_topBarPopupAnchor);
 
         g_topBarPopup = wuxc::Flyout();
@@ -14148,15 +14108,6 @@ LRESULT CALLBACK TopBarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
             // like; the panels rebuild themselves when next opened, so only the
             // clock needs touching here.
             UpdateClockText();
-
-            // Reload the wallpaper when Windows tells us the wallpaper changed.
-            // The lParam will be "Wallpaper" (case-sensitive? usually it's "Wallpaper").
-            if (lParam && wcscmp(reinterpret_cast<PCWSTR>(lParam), L"Wallpaper") == 0) {
-                if (g_wallpaperLayer) {
-                    g_wallpaperLayer.Background(GetWallpaperBrush());
-                    Wh_Log(L"TopBar: Wallpaper background updated.");
-                }
-            }
             return 0;
 
         case WM_HOTKEY:
@@ -14548,7 +14499,6 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
             try {
                 UpdateClockText();
                 UpdateBatteryButton();
-                UpdateWallpaperIfChanged();
             } catch (...) {
             }
         });
@@ -14822,8 +14772,7 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
             g_weatherSearchDebounceTimer = nullptr;
         }
 
-        // Release wallpaper layer and other no_destroy globals
-        if (g_wallpaperLayer) g_wallpaperLayer = nullptr;
+        // Release no_destroy globals
         if (g_displayFlyout) g_displayFlyout = nullptr;
                 if (g_resourceFlyout) g_resourceFlyout = nullptr;
         if (g_displayButton) g_displayButton = nullptr;
