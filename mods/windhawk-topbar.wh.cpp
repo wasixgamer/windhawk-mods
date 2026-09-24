@@ -1246,6 +1246,9 @@ DWORD g_topBarThreadId;
 HANDLE g_stopEvent = nullptr;  // Stop event for clean shutdown
 HMODULE g_modModule = nullptr;
 
+ULONGLONG g_barStartTick = 0;
+int g_bootRefreshAttempts = 0;
+
 HWND g_topBarHwnd;
 HWND g_islandHwnd;
 
@@ -7774,25 +7777,36 @@ void PopulateSoundPanel() {
 
 // Four-bar signal glyph, drawn by dropping arcs off the top of the full icon.
 FrameworkElement BuildWifiIcon(double size, int signal, bool connected) {
-    (void)signal; // unused now
-    (void)connected; // unused now
+    int level = 0;
+    if (connected) {
+        if (signal >= 75) level = 3;
+        else if (signal >= 50) level = 2;
+        else if (signal >= 25) level = 1;
+    }
 
-    // Corrected path (scientific notation replaced with decimal)
-    std::wstring wifiPath =
+    std::wstring outerPath =
         L"M61.5917 17.7222C79.4636 17.723 96.6521 24.3489 109.605 36.2305C110.58 37.1478 112.139 37.1362 113.1 36.2045"
         L"L122.423 27.1255C122.909 26.653 123.181 26.0129 123.177 25.3469C123.173 24.6809 122.894 24.0439 122.402 23.5769"
         L"C88.4054 -7.85896 34.7726 -7.85896 0.776469 23.5769C0.284012 24.0436 0.00459724 24.6804 0.0000562216 25.3463"
         L"C-0.00448479 26.0123 0.266222 26.6526 0.752273 27.1255L10.0785 36.2045C11.0385 37.1376 12.5987 37.1492 13.5734 36.2305"
-        L"C26.5276 24.3481 43.7181 17.7222 61.5917 17.7222Z"
+        L"C26.5276 24.3481 43.7181 17.7222 61.5917 17.7222Z";
+    std::wstring middlePath =
         L"M61.5676 48.0483C71.321 48.0477 80.7264 51.7249 87.9562 58.3656C88.934 59.308 90.4744 59.2876 91.4276 58.3195"
         L"L100.678 48.8392C101.165 48.342 101.435 47.6674 101.428 46.9664C101.421 46.2654 101.137 45.5965 100.64 45.1094"
         L"C78.6243 24.3363 44.5296 24.3363 22.5135 45.1094C22.0162 45.5965 21.7324 46.2657 21.7259 46.9669"
         L"C21.7194 47.6681 21.9906 48.3427 22.4788 48.8392L31.7262 58.3195C32.6795 59.2876 34.2198 59.308 35.1977 58.3656"
-        L"C42.4227 51.7293 51.8206 48.0524 61.5676 48.0483Z"
+        L"C42.4227 51.7293 51.8206 48.0524 61.5676 48.0483Z";
+    std::wstring bottomPath =
         L"M79.7076 68.1222C79.7214 68.8792 79.4551 69.6091 78.9715 70.1395L63.3304 87.7786C62.8719 88.297 62.2468 88.5888 61.5946 88.5888"
         L"C60.9423 88.5888 60.3172 88.297 59.8587 87.7786L44.215 70.1395C43.7317 69.6087 43.4659 68.8786 43.4802 68.1216"
         L"C43.4946 67.3645 43.7878 66.6477 44.2907 66.1402C54.2797 56.6989 68.9094 56.6989 78.8984 66.1402"
         L"C79.401 66.6481 79.6938 67.3652 79.7076 68.1222Z";
+
+    const wchar_t* dimOp = L"0.3";
+    const wchar_t* fullOp = L"1.0";
+    const wchar_t* outerOp = (level >= 3) ? fullOp : dimOp;
+    const wchar_t* middleOp = (level >= 2) ? fullOp : dimOp;
+    const wchar_t* bottomOp = connected ? fullOp : dimOp;
 
     std::wstring brush = GetEffectiveIconColorString();
 
@@ -7800,7 +7814,9 @@ FrameworkElement BuildWifiIcon(double size, int signal, bool connected) {
         L"<Viewbox xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" "
         L"Stretch=\"Uniform\" Width=\"" + std::to_wstring(size) + L"\" Height=\"" + std::to_wstring(size) + L"\">"
         L"<Grid Width=\"124\" Height=\"89\">"
-        L"<Path Data=\"" + EscapeXmlAttr(wifiPath) + L"\" Fill=\"" + brush + L"\"/>"
+        L"<Path Data=\"" + EscapeXmlAttr(outerPath) + L"\" Fill=\"" + brush + L"\" Opacity=\"" + outerOp + L"\"/>"
+        L"<Path Data=\"" + EscapeXmlAttr(middlePath) + L"\" Fill=\"" + brush + L"\" Opacity=\"" + middleOp + L"\"/>"
+        L"<Path Data=\"" + EscapeXmlAttr(bottomPath) + L"\" Fill=\"" + brush + L"\" Opacity=\"" + bottomOp + L"\"/>"
         L"</Grid></Viewbox>";
 
     try {
@@ -14124,6 +14140,31 @@ void RepositionTopBarPopup() {
 void EnsureTopBarPopupShown() {
     if (!g_topBarPopup || !g_topBarPopupAnchor) return;
 
+    if (g_barStartTick != 0 && g_bootRefreshAttempts < 3) {
+        static const ULONGLONG kBootRefreshTimes[3] = { 2500, 5000, 8000 };
+        ULONGLONG elapsed = GetTickCount64() - g_barStartTick;
+        if (elapsed >= kBootRefreshTimes[g_bootRefreshAttempts]) {
+            g_bootRefreshAttempts++;
+            Wh_Log(L"TopBar: boot settle invalidate %d", g_bootRefreshAttempts);
+            try {
+                if (g_rootElement) {
+                    g_rootElement.InvalidateMeasure();
+                    g_rootElement.InvalidateArrange();
+                    g_rootElement.UpdateLayout();
+                }
+                if (g_topBarPopupCanvas) {
+                    g_topBarPopupCanvas.InvalidateMeasure();
+                    g_topBarPopupCanvas.InvalidateArrange();
+                    g_topBarPopupCanvas.UpdateLayout();
+                }
+                if (g_topBarPopupHwnd && IsWindow(g_topBarPopupHwnd)) {
+                    RedrawWindow(g_topBarPopupHwnd, nullptr, nullptr,
+                                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                }
+            } catch (...) {}
+        }
+    }
+
     // Only proceed once the topbar HWND is visible and the island HWND
     // has been sized. On cold boot XAML's compositor can lag several
     // hundred milliseconds behind process start; ShowAt before that
@@ -14981,7 +15022,7 @@ void ShowElementTargetUnderCursor() {
 DWORD WINAPI TopBarThreadProc(LPVOID) {
     Wh_Log(L"TopBar: TopBarThreadProc started.");
     try {
-        // No delay – start immediately.
+        g_barStartTick = GetTickCount64();
 
         winrt::init_apartment(winrt::apartment_type::single_threaded);
 
