@@ -1015,6 +1015,13 @@ void RepositionTopBarPopup();
 void EnsureTopBarPopupShown();
 void PromoteChildFlyoutPopups();
 HWND FindOpenChildFlyoutHwnd();
+void CenterChildFlyoutPopup(double matchedWidthDip, double matchedHeightDip);
+void EnsureWideFlyoutCenterTimer();
+void StripFlyoutPopupBackgrounds(wuxc::Primitives::FlyoutBase const& fb);
+void SnapOpenChildFlyoutTo(int screenX, int screenY);
+void SetAnchorScreenPosition(FrameworkElement const& anchor, double xDip, double yDip);
+void RegisterChildPopupTarget(HWND hwnd, RECT target);
+void RefreshXamlPopupInputSites();
 
 void LoadSettings();
 double GetBarDpiScale();
@@ -1327,6 +1334,15 @@ void RegisterOpenPopup(wuxc::Primitives::FlyoutBase const& fb) {
     // popup HWND for the flyout we just registered.
     RunOnUiThread([] {
         try { PromoteChildFlyoutPopups(); } catch (...) {}
+        try { EnsureWideFlyoutCenterTimer(); } catch (...) {}
+    });
+    // PopupRoot sits above the presenter and is only present once XAML has
+    // finished laying out the popup tree, so this runs a turn later.
+    RunOnUiThread([fb] {
+        try { StripFlyoutPopupBackgrounds(fb); } catch (...) {}
+        RunOnUiThread([fb] {
+            try { StripFlyoutPopupBackgrounds(fb); } catch (...) {}
+        });
     });
 }
 
@@ -1338,6 +1354,14 @@ void UnregisterOpenPopup(wuxc::Primitives::FlyoutBase const& fb) {
                        [&](auto const& e) { return e == fb; }),
         g_openPopups.end());
     g_anyChildFlyoutOpen = !g_openPopups.empty();
+    // When the last child flyout closes, clear the position locks so a
+    // re-opened flyout can be repositioned freely by XAML on the next
+    // ShowAt — otherwise the subclass would force the previous open's
+    // coordinates onto the fresh popup.
+    if (g_openPopups.empty()) {
+        extern void ClearChildPopupTargets();
+        ClearChildPopupTargets();
+    }
 }
 
 [[clang::no_destroy]] DispatcherTimer g_clockTimer{nullptr};
@@ -6637,44 +6661,30 @@ wuxc::ControlTemplate BuildFlyoutShellTemplate(bool isMenu) {
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                  TargetType="FlyoutPresenter">
-  <Grid Background="Transparent">
-    <Grid.ChildrenTransitions>
-      <TransitionCollection>
-        <PopupThemeTransition/>
-      </TransitionCollection>
-    </Grid.ChildrenTransitions>
-    <Border x:Name="PART_BackgroundBorder"
-            Background="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Background}"
-            BorderBrush="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderBrush}"
-            BorderThickness="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderThickness}"
-            CornerRadius="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=CornerRadius}">
-      <ContentPresenter Content="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Content}"
-                        ContentTemplate="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=ContentTemplate}"
-                        ContentTransitions="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=ContentTransitions}"
-                        Padding="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Padding}"
-                        HorizontalContentAlignment="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=HorizontalContentAlignment}"
-                        VerticalContentAlignment="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=VerticalContentAlignment}"/>
-    </Border>
-  </Grid>
+  <Border x:Name="PART_BackgroundBorder"
+          Background="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Background}"
+          BorderBrush="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderBrush}"
+          BorderThickness="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderThickness}"
+          CornerRadius="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=CornerRadius}">
+    <ContentPresenter Content="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Content}"
+                      ContentTemplate="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=ContentTemplate}"
+                      ContentTransitions="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=ContentTransitions}"
+                      Padding="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Padding}"
+                      HorizontalContentAlignment="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=HorizontalContentAlignment}"
+                      VerticalContentAlignment="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=VerticalContentAlignment}"/>
+  </Border>
 </ControlTemplate>)XAML";
     static const wchar_t* kMenuShell = LR"XAML(
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                  TargetType="MenuFlyoutPresenter">
-  <Grid Background="Transparent">
-    <Grid.ChildrenTransitions>
-      <TransitionCollection>
-        <PopupThemeTransition/>
-      </TransitionCollection>
-    </Grid.ChildrenTransitions>
-    <Border x:Name="PART_BackgroundBorder"
-            Background="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Background}"
-            BorderBrush="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderBrush}"
-            BorderThickness="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderThickness}"
-            CornerRadius="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=CornerRadius}">
-      <ItemsPresenter Padding="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Padding}"/>
-    </Border>
-  </Grid>
+  <Border x:Name="PART_BackgroundBorder"
+          Background="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Background}"
+          BorderBrush="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderBrush}"
+          BorderThickness="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=BorderThickness}"
+          CornerRadius="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=CornerRadius}">
+    <ItemsPresenter Padding="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Padding}"/>
+  </Border>
 </ControlTemplate>)XAML";
     try {
         return Markup::XamlReader::Load(isMenu ? kMenuShell : kFlyoutShell)
@@ -6743,6 +6753,7 @@ wuxc::Flyout MakeControlFlyout(PCWSTR name, wuxc::StackPanel& contentOut) {
     wuxc::Flyout flyout;
     flyout.Content(blurHost);
     flyout.Placement(wuxc::Primitives::FlyoutPlacementMode::Bottom);
+    flyout.LightDismissOverlayMode(wuxc::LightDismissOverlayMode::Off);
     flyout.FlyoutPresenterStyle(MakeFlyoutPresenterStyle(kPanelWidth));
 
     // Without this the panel is clipped to the bar-height island. (Credit: the
@@ -10166,6 +10177,32 @@ void InstallGlobalMenuResources() {
         set(L"MenuFlyoutSubItemBackgroundPointerOver", hover);
         set(L"MenuFlyoutSubItemBackgroundPressed", pressed);
         set(L"MenuFlyoutSubItemBackgroundSubMenuOpened", hover);
+
+        auto themeKillBrush = FlyoutBackgroundBrush();
+        auto themeKillBorder = MakeBrush(0, 0, 0, 0);
+
+        set(L"SystemControlTransientBackground", themeKillBrush);
+        set(L"SystemControlTransientBackgroundAlt", themeKillBrush);
+        set(L"SystemControlTransientBorderBrush", themeKillBorder);
+        set(L"SystemControlTransientBorderBrushAlt", themeKillBorder);
+        set(L"SystemControlBackgroundAltHighBrush", themeKillBrush);
+        set(L"SystemControlBackgroundChromeMediumLowBrush", themeKillBrush);
+        set(L"SystemControlBackgroundListLowBrush", themeKillBrush);
+        set(L"SystemControlBackgroundListMediumBrush", themeKillBrush);
+        set(L"FlyoutBackground", themeKillBrush);
+        set(L"FlyoutBorderThemeBrush", themeKillBorder);
+        set(L"MenuFlyoutBackground", themeKillBrush);
+        set(L"ToolTipBackground", themeKillBrush);
+        set(L"ContentDialogBackground", themeKillBrush);
+        set(L"ContentDialogTopOverlay", themeKillBrush);
+        set(L"ApplicationPageBackgroundThemeBrush", themeKillBrush);
+        set(L"SolidBackgroundFillColorBase", themeKillBrush);
+        set(L"SolidBackgroundFillColorBaseAlt", themeKillBrush);
+        set(L"SolidBackgroundFillColorSecondary", themeKillBrush);
+        set(L"SolidBackgroundFillColorTertiary", themeKillBrush);
+        set(L"SolidBackgroundFillColorQuarternary", themeKillBrush);
+        set(L"LayerFillColorDefaultBrush", themeKillBrush);
+        set(L"CardBackgroundFillColorDefaultBrush", themeKillBrush);
     } catch (winrt::hresult_error const& ex) {
         Wh_Log(L"Could not install menu resources: %08X",
                static_cast<unsigned int>(ex.code().value));
@@ -10223,6 +10260,32 @@ void ApplyMenuItemLook(wuxc::MenuFlyoutItemBase const& item) {
         set(L"MenuFlyoutSubItemBackgroundPointerOver", hover);
         set(L"MenuFlyoutSubItemBackgroundPressed", pressed);
         set(L"MenuFlyoutSubItemBackgroundSubMenuOpened", hover);
+
+        auto themeKillBrush = FlyoutBackgroundBrush();
+        auto themeKillBorder = MakeBrush(0, 0, 0, 0);
+
+        set(L"SystemControlTransientBackground", themeKillBrush);
+        set(L"SystemControlTransientBackgroundAlt", themeKillBrush);
+        set(L"SystemControlTransientBorderBrush", themeKillBorder);
+        set(L"SystemControlTransientBorderBrushAlt", themeKillBorder);
+        set(L"SystemControlBackgroundAltHighBrush", themeKillBrush);
+        set(L"SystemControlBackgroundChromeMediumLowBrush", themeKillBrush);
+        set(L"SystemControlBackgroundListLowBrush", themeKillBrush);
+        set(L"SystemControlBackgroundListMediumBrush", themeKillBrush);
+        set(L"FlyoutBackground", themeKillBrush);
+        set(L"FlyoutBorderThemeBrush", themeKillBorder);
+        set(L"MenuFlyoutBackground", themeKillBrush);
+        set(L"ToolTipBackground", themeKillBrush);
+        set(L"ContentDialogBackground", themeKillBrush);
+        set(L"ContentDialogTopOverlay", themeKillBrush);
+        set(L"ApplicationPageBackgroundThemeBrush", themeKillBrush);
+        set(L"SolidBackgroundFillColorBase", themeKillBrush);
+        set(L"SolidBackgroundFillColorBaseAlt", themeKillBrush);
+        set(L"SolidBackgroundFillColorSecondary", themeKillBrush);
+        set(L"SolidBackgroundFillColorTertiary", themeKillBrush);
+        set(L"SolidBackgroundFillColorQuarternary", themeKillBrush);
+        set(L"LayerFillColorDefaultBrush", themeKillBrush);
+        set(L"CardBackgroundFillColorDefaultBrush", themeKillBrush);
         set(L"OverlayCornerRadius", winrt::box_value(MakeCorner(kMenuCorner)));
 
         if (auto control = item.try_as<wuxc::Control>()) {
@@ -10389,6 +10452,7 @@ wuxc::MenuFlyoutSeparator MakeMenuSeparator() {
 
 void StyleMenuFlyout(wuxc::MenuFlyout const& menu) {
     menu.MenuFlyoutPresenterStyle(MakeMenuPresenterStyle());
+    menu.LightDismissOverlayMode(wuxc::LightDismissOverlayMode::Off);
     // Same reason as the control flyouts: the XAML root is bar-height, so a menu
     // constrained to it would be clipped away entirely.
     menu.ShouldConstrainToRootBounds(false);
@@ -11010,6 +11074,7 @@ void Launch(const Result& r) {
 [[clang::no_destroy]] wuxc::Flyout g_startAccountFlyout{nullptr};
 [[clang::no_destroy]] wuxc::MenuFlyout g_searchResultMenu{nullptr};
 static std::atomic<bool> g_searchKeyboardActive{false};
+static double g_searchFlyoutMargin = 0.0;
 static std::atomic<bool> g_startMenuKeyboardActive{false};
 static std::atomic<bool> g_winKeyDown{false};
 static std::atomic<bool> g_winOtherSeen{false};
@@ -11618,6 +11683,7 @@ void EnsureSearchFlyoutCreated() {
             g_searchFlyout = wuxc::Flyout();
             g_searchFlyout.ShouldConstrainToRootBounds(false);
             g_searchFlyout.Placement(wuxc::Primitives::FlyoutPlacementMode::Bottom);
+            g_searchFlyout.LightDismissOverlayMode(wuxc::LightDismissOverlayMode::Off);
 
             Style presenterStyle(winrt::xaml_typename<wuxc::FlyoutPresenter>());
             presenterStyle.Setters().Append(Setter(wuxc::Control::BackgroundProperty(),
@@ -11670,6 +11736,13 @@ void EnsureSearchFlyoutCreated() {
                 Wh_Log(L"[Search] flyout Closed fired");
                 g_searchKeyboardActive = false;
                 UnregisterOpenPopup(sender.template as<wuxc::Primitives::FlyoutBase>());
+                if (auto it = g_namedElements.find(L"SearchAnchor"); it != g_namedElements.end()) {
+                    if (auto fe = it->second.try_as<FrameworkElement>()) {
+                        try {
+                            fe.RenderTransform(wuxm::TranslateTransform());
+                        } catch (...) {}
+                    }
+                }
 
                 // Stop the debounce first so the TextChanged that fires when
                 // we clear the box below doesn't restart it and re-populate
@@ -11730,11 +11803,36 @@ void ShowSearchFlyout() {
             return;
         }
 
+        double d = GetBarDpiScale();
+        if (d <= 0.0) d = 1.0;
+        RECT mrBar = GetBarMonitorRect();
+        double monW = (mrBar.right - mrBar.left) / d;
+        double monH = (mrBar.bottom - mrBar.top) / d;
+        double px = (monW - 720.0) / 2.0;
+        double py = (monH - 520.0) / 2.0 + 6.0;
+        if (px < 0) px = 0;
+        if (py < 0) py = 0;
+
+        SetAnchorScreenPosition(anchor, px, py);
+
         wuxc::Primitives::FlyoutShowOptions opts;
-        opts.Placement(wuxc::Primitives::FlyoutPlacementMode::Bottom);
+        opts.Placement(wuxc::Primitives::FlyoutPlacementMode::TopEdgeAlignedLeft);
         try {
             g_searchFlyout.ShowAt(anchor, opts);
             Wh_Log(L"[Search] shown, IsOpen=%d", g_searchFlyout.IsOpen() ? 1 : 0);
+            {
+                double dd = GetBarDpiScale();
+                if (dd <= 0.0) dd = 1.0;
+                RECT mr2 = GetBarMonitorRect();
+                int tW = static_cast<int>(720.0 * dd);
+                int tH = static_cast<int>(520.0 * dd);
+                int sx = mr2.left + (mr2.right - mr2.left - tW) / 2;
+                int sy = mr2.top + (mr2.bottom - mr2.top - tH) / 2 + static_cast<int>(6.0 * dd);
+                SnapOpenChildFlyoutTo(sx, sy);
+                RunOnUiThread([sx, sy] {
+                    try { SnapOpenChildFlyoutTo(sx, sy); } catch (...) {}
+                });
+            }
         } catch (winrt::hresult_error const& ex) {
             Wh_Log(L"[Search] ShowAt hresult %08X %s",
                    static_cast<unsigned>(ex.code().value), ex.message().c_str());
@@ -11834,11 +11932,36 @@ void ShowSearchFlyout_Unused() {
 
         BuildSearchFlyoutContent();
 
+        double d = GetBarDpiScale();
+        if (d <= 0.0) d = 1.0;
+        RECT mrBar = GetBarMonitorRect();
+        double monW = (mrBar.right - mrBar.left) / d;
+        double monH = (mrBar.bottom - mrBar.top) / d;
+        double px = (monW - 720.0) / 2.0;
+        double py = (monH - 520.0) / 2.0 + 6.0;
+        if (px < 0) px = 0;
+        if (py < 0) py = 0;
+
+        SetAnchorScreenPosition(anchor, px, py);
+
         wuxc::Primitives::FlyoutShowOptions opts;
-        opts.Placement(wuxc::Primitives::FlyoutPlacementMode::Bottom);
+        opts.Placement(wuxc::Primitives::FlyoutPlacementMode::TopEdgeAlignedLeft);
         try {
             g_searchFlyout.ShowAt(anchor, opts);
             Wh_Log(L"[Search] shown, IsOpen=%d", g_searchFlyout.IsOpen() ? 1 : 0);
+            {
+                double dd = GetBarDpiScale();
+                if (dd <= 0.0) dd = 1.0;
+                RECT mr2 = GetBarMonitorRect();
+                int tW = static_cast<int>(720.0 * dd);
+                int tH = static_cast<int>(520.0 * dd);
+                int sx = mr2.left + (mr2.right - mr2.left - tW) / 2;
+                int sy = mr2.top + (mr2.bottom - mr2.top - tH) / 2 + static_cast<int>(6.0 * dd);
+                SnapOpenChildFlyoutTo(sx, sy);
+                RunOnUiThread([sx, sy] {
+                    try { SnapOpenChildFlyoutTo(sx, sy); } catch (...) {}
+                });
+            }
         } catch (winrt::hresult_error const& ex) {
             Wh_Log(L"[Search] ShowAt hresult %08X %s",
                    static_cast<unsigned>(ex.code().value), ex.message().c_str());
@@ -12501,6 +12624,9 @@ void BuildStartMenuFlyoutContent() {
         } catch (...) {}
     });
 
+    // Wrap the blur host in a Grid with a transparent top spacer row. The
+    // spacer keeps the popup tall (so XAML places it lower on the screen)
+    // while the blur brush only covers the content-sized Border beneath it.
     g_startMenuFlyout.Content(blurHost);
 }
 
@@ -12523,7 +12649,8 @@ void ShowStartMenuFlyout() {
         if (!g_startMenuFlyout) {
             g_startMenuFlyout = wuxc::Flyout();
             g_startMenuFlyout.ShouldConstrainToRootBounds(false);
-            g_startMenuFlyout.Placement(wuxc::Primitives::FlyoutPlacementMode::TopEdgeAlignedLeft);
+            g_startMenuFlyout.Placement(wuxc::Primitives::FlyoutPlacementMode::Bottom);
+            g_startMenuFlyout.LightDismissOverlayMode(wuxc::LightDismissOverlayMode::Off);
 
             Style presenterStyle(winrt::xaml_typename<wuxc::FlyoutPresenter>());
             presenterStyle.Setters().Append(Setter(wuxc::Control::BackgroundProperty(),
@@ -12557,6 +12684,13 @@ void ShowStartMenuFlyout() {
                     try { g_startTileMenu.Hide(); } catch (...) {}
                     g_startTileMenu = nullptr;
                 }
+                if (auto it = g_namedElements.find(L"StartMenuAnchor"); it != g_namedElements.end()) {
+                    if (auto fe = it->second.try_as<FrameworkElement>()) {
+                        try {
+                            fe.RenderTransform(wuxm::TranslateTransform());
+                        } catch (...) {}
+                    }
+                }
             });
         }
 
@@ -12585,13 +12719,29 @@ void ShowStartMenuFlyout() {
         if (px < 0) px = 0;
         if (py < 0) py = 0;
 
+        SetAnchorScreenPosition(anchor, px, py);
+
         wuxc::Primitives::FlyoutShowOptions opts;
-        opts.Placement(wuxc::Primitives::FlyoutPlacementMode::Bottom);
+        opts.Placement(wuxc::Primitives::FlyoutPlacementMode::TopEdgeAlignedLeft);
 
         try {
             g_startMenuFlyout.ShowAt(anchor, opts);
             Wh_Log(L"StartMenu: shown at DIP (%.1f, %.1f) isOpen=%d",
                    px, py, g_startMenuFlyout.IsOpen() ? 1 : 0);
+            {
+                double dd = GetBarDpiScale();
+                if (dd <= 0.0) dd = 1.0;
+                RECT mr2 = GetBarMonitorRect();
+                int tW = static_cast<int>(720.0 * dd);
+                int tH = static_cast<int>(520.0 * dd);
+                int sx = mr2.left + (mr2.right - mr2.left - tW) / 2;
+                int sy = mr2.top + (mr2.bottom - mr2.top - tH) / 2;
+                SnapOpenChildFlyoutTo(sx, sy);
+                RunOnUiThread([sx, sy] {
+                    try { SnapOpenChildFlyoutTo(sx, sy); } catch (...) {}
+                });
+            }
+            EnsureWideFlyoutCenterTimer();
         } catch (winrt::hresult_error const& ex) {
             Wh_Log(L"StartMenu: ShowAt hresult %08X %s",
                    static_cast<unsigned>(ex.code().value),
@@ -12771,13 +12921,19 @@ void BuildTaskContextMenu() {
         }
     }, L"\uE921"));
 
+    items.Append(MakeMenuItem(L"Close", [] {
+        if (g_contextMenuTargetHwnd) {
+            CloseWindowGracefully(g_contextMenuTargetHwnd);
+        }
+    }, L"\uE8BB"));
+
+    items.Append(MakeMenuSeparator());
+
     items.Append(MakeMenuItem(L"Bring to front", [] {
         if (g_contextMenuTargetHwnd) {
             ForceForegroundWindow(g_contextMenuTargetHwnd);
         }
     }, L"\uE8A7"));
-
-    items.Append(MakeMenuSeparator());
 
     items.Append(MakeMenuItem(L"Open file location", [] {
         if (g_contextMenuTargetHwnd) {
@@ -12790,14 +12946,6 @@ void BuildTaskContextMenu() {
             ShowFilePropertiesForApp(g_contextMenuTargetHwnd);
         }
     }, L"\uE713"));
-
-    items.Append(MakeMenuSeparator());
-
-    items.Append(MakeMenuItem(L"Close", [] {
-        if (g_contextMenuTargetHwnd) {
-            CloseWindowGracefully(g_contextMenuTargetHwnd);
-        }
-    }, L"\uE8BB"));
 
     g_taskContextMenu = menu;
 }
@@ -16274,9 +16422,10 @@ g_centerPanel.Children().Append(resourceButton);
     {
         auto startMenuAnchor = wuxc::Grid();
         startMenuAnchor.Name(L"StartMenuAnchorGrid");
+        startMenuAnchor.Width(0);
         startMenuAnchor.Height(0);
-        startMenuAnchor.HorizontalAlignment(HorizontalAlignment::Stretch);
-        startMenuAnchor.VerticalAlignment(VerticalAlignment::Bottom);
+        startMenuAnchor.HorizontalAlignment(HorizontalAlignment::Left);
+        startMenuAnchor.VerticalAlignment(VerticalAlignment::Top);
         startMenuAnchor.IsHitTestVisible(false);
         wuxc::Grid::SetColumnSpan(startMenuAnchor, 4);
         root.Children().Append(startMenuAnchor);
@@ -16284,18 +16433,12 @@ g_centerPanel.Children().Append(resourceButton);
     }
 
     {
-        // A zero-size grid at the bottom-centre of the bar. XAML's Bottom
-        // placement centres the flyout on the anchor's own point, so this
-        // makes the flyout appear centred on the bar. Position(...) is no
-        // longer used — it was being interpreted relative to the anchor's
-        // measured bounds, which don't reliably span the full bar width
-        // when the grid's Auto/Star columns are involved.
         auto searchAnchor = wuxc::Grid();
         searchAnchor.Name(L"SearchAnchorGrid");
         searchAnchor.Width(0);
         searchAnchor.Height(0);
-        searchAnchor.HorizontalAlignment(HorizontalAlignment::Center);
-        searchAnchor.VerticalAlignment(VerticalAlignment::Bottom);
+        searchAnchor.HorizontalAlignment(HorizontalAlignment::Left);
+        searchAnchor.VerticalAlignment(VerticalAlignment::Top);
         searchAnchor.IsHitTestVisible(false);
         wuxc::Grid::SetColumnSpan(searchAnchor, 4);
         root.Children().Append(searchAnchor);
@@ -16486,6 +16629,346 @@ HWND FindOpenChildFlyoutHwnd() {
         return FALSE;
     }, reinterpret_cast<LPARAM>(&ctx));
     return ctx.result;
+}
+
+static std::mutex g_childPopupMutex;
+static std::map<HWND, RECT> g_childPopupTargets;
+static std::map<HWND, WNDPROC> g_childPopupPrevProcs;
+static int g_wideFlyoutTargetX = -1;
+static int g_wideFlyoutTargetY = -1;
+
+LRESULT CALLBACK ChildFlyoutPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC prev = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_childPopupMutex);
+        auto it = g_childPopupPrevProcs.find(hwnd);
+        if (it != g_childPopupPrevProcs.end()) prev = it->second;
+    }
+
+    if (msg == WM_WINDOWPOSCHANGING) {
+        RECT target{};
+        bool haveTarget = false;
+        {
+            std::lock_guard<std::mutex> lock(g_childPopupMutex);
+            auto it = g_childPopupTargets.find(hwnd);
+            if (it != g_childPopupTargets.end()) {
+                target = it->second;
+                haveTarget = (target.right > target.left && target.bottom > target.top);
+            }
+        }
+        if (haveTarget) {
+            auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+            wp->x = target.left;
+            wp->y = target.top;
+            wp->flags &= ~SWP_NOMOVE;
+        }
+    }
+
+    if (msg == WM_DESTROY) {
+        std::lock_guard<std::mutex> lock(g_childPopupMutex);
+        g_childPopupTargets.erase(hwnd);
+        g_childPopupPrevProcs.erase(hwnd);
+    }
+
+    return prev ? CallWindowProc(prev, hwnd, msg, wParam, lParam)
+                : DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void ClearChildPopupTargets() {
+    std::lock_guard<std::mutex> lock(g_childPopupMutex);
+    g_childPopupTargets.clear();
+}
+
+void RegisterChildPopupTarget(HWND hwnd, RECT target) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    bool needSubclass = false;
+    {
+        std::lock_guard<std::mutex> lock(g_childPopupMutex);
+        g_childPopupTargets[hwnd] = target;
+        if (g_childPopupPrevProcs.find(hwnd) == g_childPopupPrevProcs.end()) {
+            needSubclass = true;
+        }
+    }
+    if (needSubclass) {
+        WNDPROC prev = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtr(hwnd, GWLP_WNDPROC,
+                             reinterpret_cast<LONG_PTR>(ChildFlyoutPopupProc)));
+        if (prev) {
+            std::lock_guard<std::mutex> lock(g_childPopupMutex);
+            g_childPopupPrevProcs[hwnd] = prev;
+        }
+    }
+    SetWindowPos(hwnd, nullptr, target.left, target.top,
+                 target.right - target.left, target.bottom - target.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void RefreshXamlPopupInputSites() {
+    std::vector<wuxc::Primitives::FlyoutBase> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_openPopupMutex);
+        snapshot = g_openPopups;
+    }
+    for (auto const& fb : snapshot) {
+        try {
+            auto flyout = fb.try_as<wuxc::Flyout>();
+            if (!flyout) continue;
+            auto fe = flyout.Content().try_as<FrameworkElement>();
+            if (!fe) continue;
+            if (auto xr = fe.XamlRoot()) {
+                if (auto root = xr.Content()) {
+                    root.UpdateLayout();
+                }
+            }
+            fe.UpdateLayout();
+        } catch (...) {}
+    }
+}
+
+void SetAnchorScreenPosition(FrameworkElement const& anchor, double xDip, double yDip) {
+    if (!anchor) return;
+    try {
+        wuxm::TranslateTransform tt;
+        tt.X(xDip);
+        tt.Y(yDip);
+        anchor.RenderTransform(tt);
+        anchor.UpdateLayout();
+    } catch (...) {}
+}
+
+void SnapOpenChildFlyoutTo(int screenX, int screenY) {
+    g_wideFlyoutTargetX = screenX;
+    g_wideFlyoutTargetY = screenY;
+    HWND h = FindOpenChildFlyoutHwnd();
+    if (!h || !IsWindow(h)) return;
+    RECT r{};
+    if (!GetWindowRect(h, &r)) return;
+    int w = r.right - r.left;
+    int hh = r.bottom - r.top;
+    // If XAML already placed the popup within tolerance of the target, do
+    // nothing. Moving an already-correctly-placed HWND would desync XAML's
+    // input site and break mouse hover.
+    if (std::abs(r.left - screenX) <= 4 && std::abs(r.top - screenY) <= 4) {
+        return;
+    }
+    RECT target{ screenX, screenY, screenX + w, screenY + hh };
+    RegisterChildPopupTarget(h, target);
+    RunOnUiThread([] {
+        try { RefreshXamlPopupInputSites(); } catch (...) {}
+    });
+}
+
+[[clang::no_destroy]] DispatcherTimer g_wideFlyoutCenterTimer{nullptr};
+
+void EnforceWideFlyoutCentering() {
+    if (InterlockedCompareExchange(&g_shuttingDown, 0, 0) != 0) return;
+
+    struct Ctx { DWORD pid; };
+    Ctx ctx{ GetCurrentProcessId() };
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (hwnd == g_topBarHwnd || hwnd == g_islandHwnd ||
+            hwnd == g_topBarPopupHwnd) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != c->pid) return TRUE;
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        wchar_t cls[256]{};
+        if (!GetClassName(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
+        if (!(wcsstr(cls, L"Xaml") && wcsstr(cls, L"Popup"))) return TRUE;
+        RECT r{};
+        if (!GetWindowRect(hwnd, &r)) return TRUE;
+        if (r.right - r.left < 100) return TRUE;
+
+        // If this wide popup isn't currently position-locked and we have a
+        // stored target from a SnapOpenChildFlyoutTo call, re-register the
+        // lock — this recovers from XAML destroying and re-creating the
+        // popup HWND (which happens when the flyout's content size changes).
+        if (g_wideFlyoutTargetX >= 0 && g_wideFlyoutTargetY >= 0) {
+            double dpi = GetBarDpiScale();
+            if (dpi <= 0.0) dpi = 1.0;
+            if (r.right - r.left >= static_cast<int>(600.0 * dpi)) {
+                bool haveTarget = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_childPopupMutex);
+                    haveTarget = g_childPopupTargets.find(hwnd) !=
+                                 g_childPopupTargets.end();
+                }
+                if (!haveTarget) {
+                    RECT target{ g_wideFlyoutTargetX, g_wideFlyoutTargetY,
+                                 g_wideFlyoutTargetX + (r.right - r.left),
+                                 g_wideFlyoutTargetY + (r.bottom - r.top) };
+                    RegisterChildPopupTarget(hwnd, target);
+                    RunOnUiThread([] {
+                        try { RefreshXamlPopupInputSites(); } catch (...) {}
+                    });
+                }
+            }
+        }
+
+        static auto s_swca = []() -> BOOL (WINAPI*)(HWND, void*) {
+            HMODULE m = GetModuleHandleW(L"user32.dll");
+            return m ? reinterpret_cast<BOOL (WINAPI*)(HWND, void*)>(
+                GetProcAddress(m, "SetWindowCompositionAttribute")) : nullptr;
+        }();
+        if (s_swca) {
+            struct { int AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; } policy{};
+            policy.AccentState = 0;
+            struct { UINT Attrib; void* pvData; SIZE_T cbData; } data{};
+            data.Attrib = 19;
+            data.pvData = &policy;
+            data.cbData = sizeof(policy);
+            s_swca(hwnd, &data);
+        }
+
+        DWORD backdropNone = 1;
+        DwmSetWindowAttribute(hwnd, 38, &backdropNone, sizeof(backdropNone));
+
+        BOOL micaOff = FALSE;
+        DwmSetWindowAttribute(hwnd, 1029, &micaOff, sizeof(micaOff));
+
+        BOOL ncreOff = FALSE;
+        DwmSetWindowAttribute(hwnd, 1, &ncreOff, sizeof(ncreOff));
+
+        DWORD ncrpDisabled = 1;
+        DwmSetWindowAttribute(hwnd, 2, &ncrpDisabled, sizeof(ncrpDisabled));
+
+        MARGINS margins{0, 0, 0, 0};
+        DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+        BOOL hostBrushOff = FALSE;
+        DwmSetWindowAttribute(hwnd, 17, &hostBrushOff, sizeof(hostBrushOff));
+
+        DWORD cornerDoNotRound = 1;
+        DwmSetWindowAttribute(hwnd, 33, &cornerDoNotRound, sizeof(cornerDoNotRound));
+
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+}
+
+// Walks up from the flyout's presenter to the popup root, clearing every
+// non-blur Background it finds. This reaches XAML's PopupRoot, which draws
+// the opaque theme-colored backdrop above the presenter's own Background —
+// no amount of styling the presenter or its children can hide it.
+void StripFlyoutPopupBackgrounds(wuxc::Primitives::FlyoutBase const& fb) {
+    if (!fb) return;
+    auto flyout = fb.try_as<wuxc::Flyout>();
+    if (!flyout) return;
+    auto content = flyout.Content().try_as<DependencyObject>();
+    if (!content) return;
+
+    wuxc::FlyoutPresenter presenter{nullptr};
+    DependencyObject current = content;
+    while (auto parent = wuxm::VisualTreeHelper::GetParent(current)) {
+        if (auto p = parent.try_as<wuxc::FlyoutPresenter>()) {
+            presenter = p;
+            break;
+        }
+        current = parent;
+    }
+    if (!presenter) return;
+
+    auto isOurBlur = [](wf::IInspectable const& obj) {
+        return obj && obj.try_as<wuxm::XamlCompositionBrushBase>() != nullptr;
+    };
+    auto transparent = MakeBrush(0, 0, 0, 0);
+
+    DependencyObject node = presenter;
+    while (node) {
+        try {
+            if (auto panel = node.try_as<wuxc::Panel>()) {
+                if (panel.Background() && !isOurBlur(panel.Background())) {
+                    panel.Background(transparent);
+                }
+            } else if (auto b = node.try_as<wuxc::Border>()) {
+                if (b.Background() && !isOurBlur(b.Background())) {
+                    b.Background(transparent);
+                }
+            } else if (auto cp = node.try_as<wuxc::ContentPresenter>()) {
+                if (cp.Background() && !isOurBlur(cp.Background())) {
+                    cp.Background(transparent);
+                }
+            } else if (auto ctrl = node.try_as<wuxc::Control>()) {
+                if (ctrl.Background() && !isOurBlur(ctrl.Background())) {
+                    ctrl.Background(transparent);
+                }
+            }
+        } catch (...) {}
+        try {
+            node = wuxm::VisualTreeHelper::GetParent(node);
+        } catch (...) { break; }
+    }
+}
+
+void EnsureWideFlyoutCenterTimer() {
+    if (!g_wideFlyoutCenterTimer) {
+        g_wideFlyoutCenterTimer = DispatcherTimer();
+        g_wideFlyoutCenterTimer.Interval(std::chrono::milliseconds(50));
+        g_wideFlyoutCenterTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
+            if (InterlockedCompareExchange(&g_shuttingDown, 0, 0) != 0) {
+                g_wideFlyoutCenterTimer.Stop();
+                return;
+            }
+            if (!g_anyChildFlyoutOpen.load()) {
+                g_wideFlyoutCenterTimer.Stop();
+                return;
+            }
+            try { EnforceWideFlyoutCentering(); } catch (...) {}
+        });
+    }
+    g_wideFlyoutCenterTimer.Stop();
+    g_wideFlyoutCenterTimer.Start();
+}
+
+// Repositions an open child XAML flyout popup so that it's vertically and
+// horizontally centered on the topbar's monitor. matchedWidthDip and
+// matchedHeightDip are used to identify the correct popup among possibly
+// several open ones in this process.
+void CenterChildFlyoutPopup(double matchedWidthDip, double matchedHeightDip) {
+    double dpi = GetBarDpiScale();
+    if (dpi <= 0.0) dpi = 1.0;
+    int matchW = static_cast<int>(matchedWidthDip * dpi + 0.5);
+    int matchH = static_cast<int>(matchedHeightDip * dpi + 0.5);
+
+    struct Ctx {
+        DWORD pid;
+        int matchW, matchH;
+        HWND result;
+    } ctx{ GetCurrentProcessId(), matchW, matchH, nullptr };
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (hwnd == g_topBarHwnd || hwnd == g_islandHwnd ||
+            hwnd == g_topBarPopupHwnd) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != c->pid) return TRUE;
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        wchar_t cls[256]{};
+        if (!GetClassName(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
+        if (!(wcsstr(cls, L"Xaml") && wcsstr(cls, L"Popup"))) return TRUE;
+        RECT r{};
+        if (!GetWindowRect(hwnd, &r)) return TRUE;
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (std::abs(w - c->matchW) > 60) return TRUE;
+        if (std::abs(h - c->matchH) > 60) return TRUE;
+        c->result = hwnd;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    if (!ctx.result) return;
+    RECT r{};
+    if (!GetWindowRect(ctx.result, &r)) return;
+    int w = r.right - r.left;
+    int h = r.bottom - r.top;
+    RECT mr = GetBarMonitorRect();
+    int x = mr.left + ((mr.right - mr.left) - w) / 2;
+    int y = mr.top + ((mr.bottom - mr.top) - h) / 2;
+    RECT target{ x, y, x + w, y + h };
+    RegisterChildPopupTarget(ctx.result, target);
+    EnsureWideFlyoutCenterTimer();
 }
 
 void ResetTopBarPointerState() {
@@ -18968,6 +19451,10 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         if (g_searchDebounceTimer) {
             g_searchDebounceTimer.Stop();
             g_searchDebounceTimer = nullptr;
+        }
+        if (g_wideFlyoutCenterTimer) {
+            g_wideFlyoutCenterTimer.Stop();
+            g_wideFlyoutCenterTimer = nullptr;
         }
         if (g_searchFlyout) {
             try { g_searchFlyout.Hide(); } catch (...) {}
